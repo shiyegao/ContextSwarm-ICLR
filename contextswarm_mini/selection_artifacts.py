@@ -1015,7 +1015,12 @@ def _validate_store_record(record_type: str, raw: Mapping[str, Any]) -> dict[str
         if row["candidate_sha256"] != _store_digest(payload, "candidate_payload"):
             raise ArtifactValidationError("search candidate hash does not match candidate payload")
         _store_object(row, "feedback_snapshot")
-        _store_object(row, "snapshot_watermarks")
+        # New exports derive the immutable selection watermark from their
+        # parent search event and therefore omit this candidate field.  Keep
+        # accepting the field for v1/legacy exports so old artifacts remain
+        # replayable and can be compared without rewriting history.
+        if "snapshot_watermarks" in row:
+            _store_object(row, "snapshot_watermarks")
     elif record_type == "selector_config":
         _text(row, "selector_name")
         _store_sha256(row, "config_sha256")
@@ -1055,8 +1060,11 @@ def _validate_store_record(record_type: str, raw: Mapping[str, Any]) -> dict[str
 
         nonempty_pool_fields = {name for name in present_pool_fields if _has_pool_value(name)}
         # The store's migration defaults legacy rows to empty strings / an
-        # empty object.  Treat that exact all-empty triplet as "not supplied".
-        if nonempty_pool_fields and present_pool_fields != pool_fields:
+        # empty object.  Treat an entirely absent triplet, or an explicitly
+        # present all-empty triplet, as "not supplied".  Any partial triplet
+        # is rejected even when its present values are empty: otherwise an
+        # artifact can silently lose one side of the pool identity contract.
+        if present_pool_fields and present_pool_fields != pool_fields:
             raise ArtifactValidationError("search event pool snapshot fields must be complete")
         if nonempty_pool_fields:
             _store_sha256(row, "eligible_candidates_sha256")
@@ -1227,13 +1235,26 @@ def _validate_store_joins(grouped: Mapping[str, Sequence[Mapping[str, Any]]]) ->
             raise ArtifactValidationError("search candidate feedback snapshot mismatch")
         if _identity_sha256(payload) != candidate["candidate_sha256"]:
             raise ArtifactValidationError("search candidate payload hash mismatch")
-        if candidate["snapshot_watermarks"] != search.get("snapshot_watermarks"):
-            raise ArtifactValidationError("search candidate watermark mismatch")
+        if "snapshot_watermarks" in candidate:
+            if (
+                "snapshot_watermarks" not in search
+                or candidate["snapshot_watermarks"] != search.get("snapshot_watermarks")
+            ):
+                raise ArtifactValidationError("search candidate watermark mismatch")
         candidate_by_search.setdefault(candidate["search_event_id"], []).append(candidate)
     for search_id, rows_for_search in candidate_by_search.items():
         orders = sorted(row["pool_order"] for row in rows_for_search)
         if orders != list(range(1, len(orders) + 1)):
             raise ArtifactValidationError(f"search event {search_id!r} has non-contiguous candidate pool order")
+        watermark_presence = ["snapshot_watermarks" in row for row in rows_for_search]
+        if any(watermark_presence) and not all(watermark_presence):
+            # A partially rewritten export is ambiguous: consumers could not
+            # tell whether the absent rows are new parent-derived records or
+            # truncated legacy records.  Require one representation per
+            # selection (all legacy child copies or all new parent-only rows).
+            raise ArtifactValidationError(
+                "search candidate watermark fields must be all present or all absent"
+            )
         search = searches[search_id]
         ordered_rows = sorted(rows_for_search, key=lambda row: row["pool_order"])
         candidate_payloads = [row["candidate_payload"] for row in ordered_rows]
