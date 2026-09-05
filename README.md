@@ -223,9 +223,14 @@ provider circuit breaker 或使 formal artifact 失格。
 如果整个 Pi RPC/session 进程在收到 `agent_settled` 前异常退出，`[pi.recovery]`
 提供 runner 级的有界恢复：默认在原 horizon 内重启一次，沿用同一个逻辑
 `actor/task/episode`、workspace、candidate 和确定性的 Pi session，因此已有进度
-可以继续使用。退避时间计入 horizon；正常满分、horizon 到点、runner 主动取消以及
-Judge 返回的候选 verdict 不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会
-写入 `events.jsonl`，便于区分 agent 进程故障与候选本身的 PE/WA/超时。
+可以继续使用。只有非超时、非主动取消的异常进程/调用失败才会进入这层恢复；Pi
+任务超时（包括 inner Pi timeout）、runner 主动取消和正常 horizon closeout 都是该
+逻辑 actor 的终态，不会重启或同 actor refill。CPS 仍可在释放 slot 后由调度器接纳
+新的 assignment；这不是对已停止 actor 的 recovery。退避时间计入 horizon；Judge
+返回的候选 verdict 也不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会写入
+`events.jsonl`，其中耗尽原因区分 `task_timeout`、`intentional_cancel`、`horizon`
+、`runner_failure`、`remote_settlement_unconfirmed` 和异常/重试预算路径，便于区分
+agent 进程故障与候选本身的 PE/WA/超时。
 
 每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
 session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发

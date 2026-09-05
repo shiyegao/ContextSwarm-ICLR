@@ -3,13 +3,16 @@
 The Pi runtime already retries provider requests inside a live session.  This
 module owns the narrower outer boundary: when that whole RPC process/session
 exits abnormally, restart the same logical actor against its persisted session
-and workspace, without extending the experiment horizon.
+and workspace, without extending the experiment horizon.  A task timeout or
+an intentional cancellation is terminal at this boundary; only an abnormal
+non-timeout, non-cancelled failure may be restarted.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import math
+import subprocess
 import time
 from typing import Any, Callable
 
@@ -59,7 +62,11 @@ def _exception_result(
 
     label = _exception_label(exc)
     now = time.monotonic()
-    timed_out = isinstance(exc, TimeoutError)
+    # ``subprocess.TimeoutExpired`` is not a subclass of the built-in
+    # ``TimeoutError`` on all supported Python versions.  Normalize both
+    # forms at this boundary so an adapter that lets the subprocess exception
+    # escape cannot accidentally enter the abnormal-process retry path.
+    timed_out = isinstance(exc, (TimeoutError, subprocess.TimeoutExpired))
     cancelled = _event_is_set(cancel_event)
     horizon_reached = now >= float(deadline_monotonic)
     return (
@@ -154,19 +161,111 @@ def is_recoverable_agent_failure(
 
     Candidate quality is deliberately absent from this classifier.  PE, WA,
     verification failures, and other Judge verdicts are candidate-attempt
-    outcomes, not process/session failures.  A timeout may be recoverable only
-    when it was an inner Pi timeout and the fixed run deadline still has time;
-    reaching the run horizon itself is terminal.
+    outcomes, not process/session failures.  A task timeout (including an
+    inner Pi timeout) and an intentional cancellation are always terminal.
+    Only a non-timeout, non-cancelled abnormal process/invocation failure is
+    recoverable while the fixed run deadline still has time; reaching the run
+    horizon itself is terminal.
     """
 
     now = time.monotonic() if now_monotonic is None else float(now_monotonic)
     return bool(
         result.returncode != 0
+        and not result.timed_out
         and not result.cancelled
         and not result.run_horizon_reached
         and now < float(deadline_monotonic)
         and not _event_is_set(cancel_event)
     )
+
+
+_INTENTIONAL_CANCEL_REASONS = frozenset(
+    {
+        "active_cancel",
+        "cancelled",
+        "full_score",
+        "operator_stop",
+        "task_solved",
+        "task_solved_by_peer",
+    }
+)
+_FAIL_CLOSED_CANCEL_REASONS = frozenset(
+    {
+        "remote_settlement_unconfirmed",
+        "runner_failure",
+    }
+)
+
+
+def _stable_cancellation_reason(cancel_event: Any | None) -> str:
+    """Project an Event-compatible stop source onto a bounded vocabulary.
+
+    Runner cancellation adapters may expose ``cancellation_reason`` (for
+    example ``_AnyCancelEvent``).  Do not copy arbitrary adapter text into an
+    artifact: known task/operator stops are grouped as ``intentional_cancel``
+    while fail-closed runner/infrastructure latches retain their stable source
+    labels.  A plain Event or an unknown source is conservatively intentional.
+    """
+
+    if cancel_event is None:
+        return "intentional_cancel"
+    reason_getter = getattr(cancel_event, "cancellation_reason", None)
+    if callable(reason_getter):
+        try:
+            raw_reason = reason_getter()
+        except Exception:
+            raw_reason = None
+        if isinstance(raw_reason, str):
+            reason = raw_reason.strip().casefold()
+            if reason in _FAIL_CLOSED_CANCEL_REASONS:
+                return reason
+            if reason in _INTENTIONAL_CANCEL_REASONS:
+                return "intentional_cancel"
+    return "intentional_cancel"
+
+
+def _recovery_exhaustion_reason(
+    result: AgentResult,
+    *,
+    recoverable: bool,
+    cancel_event: Any | None,
+) -> str:
+    """Return a bounded reason for a failed attempt that will not relaunch.
+
+    The reason is intentionally a small stable vocabulary for comparison
+    artifacts.  ``restart_limit`` remains distinct from the stop classification
+    because it means an otherwise recoverable abnormal failure consumed the
+    configured retry budget.
+    """
+
+    if result.run_horizon_reached:
+        return "horizon"
+    if result.timed_out:
+        return "task_timeout"
+    if result.cancelled or _event_is_set(cancel_event):
+        return _stable_cancellation_reason(cancel_event)
+    if recoverable:
+        return "restart_limit"
+    return "abnormal"
+
+
+def _normalize_terminal_flags(result: AgentResult) -> None:
+    """Make terminal stop flags authoritative even when an adapter reports rc=0.
+
+    ``AgentResult`` is an adapter boundary and a few test/provider shims have
+    historically returned a successful process code while setting a timeout
+    or cancellation marker.  Letting that combination fall through the
+    success branch would both emit a false success and permit a same-actor
+    refill.  Preserve nonzero codes, but synthesize the conventional timeout
+    or cancellation code for a malformed zero-code terminal result.
+    """
+
+    if result.returncode != 0:
+        return
+    if result.run_horizon_reached or result.timed_out:
+        result.returncode = 124
+    elif result.cancelled:
+        result.returncode = 130
 
 
 def run_with_recovery(
@@ -187,10 +286,12 @@ def run_with_recovery(
     actor/task/episode, workspace, prompt, and deadline fixed across calls.
     Pi derives its session identity from actor/episode and therefore resumes
     the same persisted conversation; the mutable candidate workspace is also
-    retained.  If an invocation raises an ordinary ``Exception``, it is
-    converted to a bounded failed attempt and follows the same retry policy;
-    ``BaseException`` subclasses such as ``KeyboardInterrupt`` still escape.
-    Backoff time counts against ``deadline_monotonic``.
+    retained.  Timeout and intentional-cancellation results are terminal and
+    never relaunch.  If an invocation raises an ordinary ``Exception``, it is
+    converted to a bounded failed attempt and follows the same retry policy
+    (except for a timeout exception); ``BaseException`` subclasses such as
+    ``KeyboardInterrupt`` still escape.  Backoff time counts against
+    ``deadline_monotonic``.
     """
 
     if isinstance(max_restarts, bool) or int(max_restarts) < 0:
@@ -256,8 +357,9 @@ def run_with_recovery(
         except Exception as exc:
             # PiAgent normally converts transport/process errors into an
             # AgentResult.  Keep the generic boundary defensive for adapters
-            # or test/runtime shims that raise instead: retry the logical
-            # actor, but never copy an exception message into artifacts.
+            # or test/runtime shims that raise instead: an abnormal exception
+            # may retry the logical actor, while a timeout exception remains
+            # terminal; never copy an exception message into artifacts.
             result, invocation_exception_type = _exception_result(
                 exc,
                 task_id=task_id,
@@ -279,6 +381,7 @@ def run_with_recovery(
             and time.monotonic() >= float(deadline_monotonic)
         ):
             result.run_horizon_reached = True
+        _normalize_terminal_flags(result)
         if result.returncode == 0:
             if recovery_attempt:
                 emit(
@@ -320,7 +423,11 @@ def run_with_recovery(
                 reason=(
                     "restart_limit"
                     if recoverable
-                    else "cancelled_or_horizon_or_nonfailure"
+                    else _recovery_exhaustion_reason(
+                        result,
+                        recoverable=recoverable,
+                        cancel_event=cancel_event,
+                    )
                 ),
             )
             return result

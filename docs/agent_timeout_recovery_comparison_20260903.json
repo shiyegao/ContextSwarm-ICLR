@@ -1,0 +1,249 @@
+{
+  "schema_version": "contextswarm_agent_timeout_comparison_v1",
+  "description": "Sanitized projections for the three-arm MathOlympiadBench comparison; no prompts, responses, candidates, credentials, endpoints, or raw profiling/events.",
+  "contract": {
+    "dataset": "matholympiadbench",
+    "task_count": 12,
+    "horizon_seconds": 3600,
+    "max_parallel": 32,
+    "initial_agents_per_task": 2,
+    "episodes_per_task": 2,
+    "model": "openai-codex/gpt-5.6-sol",
+    "thinking": "max",
+    "seed": 0,
+    "judge_timeout_seconds": 300,
+    "allocator_decision_timeout_seconds": 900,
+    "pi_inner_retry_unchanged": true
+  },
+  "arms": {
+    "baseline_900_recovery": {
+      "source_commit": "33296b07634c708412326c2808d5782dab3f788e",
+      "pi_timeout_seconds": 900,
+      "timeout_outer_recovery": true,
+      "aggregate": {
+        "score_mean": 4.666666666666667,
+        "score_sample_sd": 0.5773502691896257,
+        "normalized_score_time_auc_mean": 0.23102408,
+        "normalized_score_time_auc_sample_sd": 0.03958665556047012,
+        "time_to_first_proof_seconds_mean": 140.31692033333334,
+        "assigned_count_mean": 80.0,
+        "solver_timeout_count_mean": 63.333333333333336,
+        "solver_cancelled_count_mean": 14.0,
+        "recovery_scheduled_mean": 64.66666666666667,
+        "recovery_succeeded_mean": 1.6666666666666667,
+        "solver_slot_utilization_mean": 0.9999761666666668,
+        "run_wall_seconds_mean": 3732.5889566666665,
+        "judge_probe_infrastructure_error_count_mean": 20.0
+      },
+      "runs": [
+        {
+          "run_id": "20260901T012227Z-8c90d3f0",
+          "score": 5,
+          "normalized_score_time_auc": 0.22883296,
+          "time_to_first_proof_seconds": 93.256489,
+          "assigned_count": 82,
+          "solver_timeout_count": 62,
+          "solver_cancelled_count": 17,
+          "recovery_scheduled": 65,
+          "recovery_succeeded": 1,
+          "solver_slot_utilization": 0.9999801,
+          "run_wall_seconds": 3647.587062,
+          "judge_probe_infrastructure_error_count": 22
+        },
+        {
+          "run_id": "20260902T075657Z-eda06caf",
+          "score": 4,
+          "normalized_score_time_auc": 0.19257849,
+          "time_to_first_proof_seconds": 167.414603,
+          "assigned_count": 76,
+          "solver_timeout_count": 64,
+          "solver_cancelled_count": 10,
+          "recovery_scheduled": 65,
+          "recovery_succeeded": 2,
+          "solver_slot_utilization": 0.99996502,
+          "run_wall_seconds": 3903.21947,
+          "judge_probe_infrastructure_error_count": 19
+        },
+        {
+          "run_id": "20260902T090313Z-ecee9c07",
+          "score": 5,
+          "normalized_score_time_auc": 0.27166079,
+          "time_to_first_proof_seconds": 160.279669,
+          "assigned_count": 82,
+          "solver_timeout_count": 64,
+          "solver_cancelled_count": 15,
+          "recovery_scheduled": 64,
+          "recovery_succeeded": 2,
+          "solver_slot_utilization": 0.99998338,
+          "run_wall_seconds": 3646.960338,
+          "judge_probe_infrastructure_error_count": 19
+        }
+      ]
+    },
+    "treatment_900_no_timeout_recovery": {
+      "source_commit": "fefb7644ca10f27541d52434c5e0d1a20428de61",
+      "pi_timeout_seconds": 900,
+      "timeout_outer_recovery": false,
+      "aggregate": {
+        "score_mean": 3.3333333333333335,
+        "score_sample_sd": 1.1547005383792515,
+        "normalized_score_time_auc_mean": 0.16460178,
+        "normalized_score_time_auc_sample_sd": 0.03587439411462304,
+        "time_to_first_proof_seconds_mean": 123.257049,
+        "assigned_count_mean": 137.66666666666666,
+        "solver_timeout_count_mean": 126.66666666666667,
+        "solver_cancelled_count_mean": 10.333333333333334,
+        "recovery_scheduled_mean": 3.0,
+        "recovery_succeeded_mean": 0.3333333333333333,
+        "solver_slot_utilization_mean": 0.9999423633333334,
+        "run_wall_seconds_mean": 3752.227395,
+        "judge_probe_infrastructure_error_count_mean": 8.333333333333334
+      },
+      "runs": [
+        {
+          "run_id": "20260902T051107Z-3d88881e",
+          "score": 4,
+          "normalized_score_time_auc": 0.17976994,
+          "time_to_first_proof_seconds": 125.138295,
+          "assigned_count": 138,
+          "solver_timeout_count": 126,
+          "solver_cancelled_count": 11,
+          "recovery_scheduled": 2,
+          "recovery_succeeded": 1,
+          "solver_slot_utilization": 0.99993613,
+          "run_wall_seconds": 3930.72646,
+          "judge_probe_infrastructure_error_count": 8
+        },
+        {
+          "run_id": "20260902T100459Z-deb0d842",
+          "score": 2,
+          "normalized_score_time_auc": 0.12363481,
+          "time_to_first_proof_seconds": 118.359884,
+          "assigned_count": 134,
+          "solver_timeout_count": 128,
+          "solver_cancelled_count": 6,
+          "recovery_scheduled": 2,
+          "recovery_succeeded": 0,
+          "solver_slot_utilization": 0.9999386,
+          "run_wall_seconds": 3696.512389,
+          "judge_probe_infrastructure_error_count": 10
+        },
+        {
+          "run_id": "20260902T110746Z-d7f1cc93",
+          "score": 4,
+          "normalized_score_time_auc": 0.19040059,
+          "time_to_first_proof_seconds": 126.272968,
+          "assigned_count": 141,
+          "solver_timeout_count": 126,
+          "solver_cancelled_count": 14,
+          "recovery_scheduled": 5,
+          "recovery_succeeded": 0,
+          "solver_slot_utilization": 0.99995236,
+          "run_wall_seconds": 3629.443336,
+          "judge_probe_infrastructure_error_count": 7
+        }
+      ]
+    },
+    "treatment_1800_uninterrupted": {
+      "source_commit": "74998a53e43e62246ce0af2553b7193976e67b39",
+      "image_id": "sha256:3225811d8ee880d8918547b2a9f08859039940ec45c1c730015596b63998af6d",
+      "pi_timeout_seconds": 1800,
+      "timeout_outer_recovery": false,
+      "aggregate": {
+        "score_mean": 6.333333333333333,
+        "score_sample_sd": 1.1547005383792515,
+        "normalized_score_time_auc_mean": 0.32268406,
+        "normalized_score_time_auc_sample_sd": 0.005440326759883096,
+        "time_to_first_proof_seconds_mean": 182.90431066666667,
+        "assigned_count_mean": 86.66666666666667,
+        "solver_timeout_count_mean": 61.333333333333336,
+        "solver_cancelled_count_mean": 24.0,
+        "recovery_scheduled_mean": 6.0,
+        "recovery_succeeded_mean": 0.0,
+        "solver_slot_utilization_mean": 0.9999831166666667,
+        "run_wall_seconds_mean": 3674.7452906666667,
+        "judge_probe_infrastructure_error_count_mean": 14.0
+      },
+      "runs": [
+        {
+          "run_id": "20260903T104820Z-d67daadf",
+          "score": 7,
+          "normalized_score_time_auc": 0.32891312,
+          "time_to_first_proof_seconds": 161.24962,
+          "assigned_count": 90,
+          "solver_timeout_count": 62,
+          "solver_cancelled_count": 27,
+          "recovery_scheduled": 4,
+          "recovery_succeeded": 0,
+          "solver_slot_utilization": 0.99998264,
+          "run_wall_seconds": 3682.198012,
+          "judge_probe_infrastructure_error_count": 13
+        },
+        {
+          "run_id": "20260903T120650Z-f6ef8a8a",
+          "score": 7,
+          "normalized_score_time_auc": 0.31886507,
+          "time_to_first_proof_seconds": 228.696695,
+          "assigned_count": 91,
+          "solver_timeout_count": 61,
+          "solver_cancelled_count": 28,
+          "recovery_scheduled": 7,
+          "recovery_succeeded": 0,
+          "solver_slot_utilization": 0.99998368,
+          "run_wall_seconds": 3709.367141,
+          "judge_probe_infrastructure_error_count": 14
+        },
+        {
+          "run_id": "20260903T131006Z-7c6668fd",
+          "score": 5,
+          "normalized_score_time_auc": 0.32027399,
+          "time_to_first_proof_seconds": 158.766617,
+          "assigned_count": 79,
+          "solver_timeout_count": 61,
+          "solver_cancelled_count": 17,
+          "recovery_scheduled": 7,
+          "recovery_succeeded": 0,
+          "solver_slot_utilization": 0.99998303,
+          "run_wall_seconds": 3632.670719,
+          "judge_probe_infrastructure_error_count": 15
+        }
+      ]
+    }
+  },
+  "proof_phase_attribution": {
+    "baseline_900_recovery": {
+      "run_count": 3,
+      "live_judge_proof_credit_count": 9,
+      "after_timeout_recovery_started_count": 6
+    },
+    "treatment_1800_uninterrupted": {
+      "run_count": 3,
+      "live_judge_proof_credit_count": 17,
+      "after_900_seconds_in_same_single_process_count": 11
+    },
+    "definitions": {
+      "live_judge_proof_credit_count": "judge_proof_credited emitted during the workload; final closeout-only confirmations excluded",
+      "after_timeout_recovery_started_count": "proof occurred after attempt 0 timed out and recovery attempt 1 started",
+      "after_900_seconds_in_same_single_process_count": "proof occurred more than 900 seconds after the sole preceding Pi process start"
+    }
+  },
+  "task_outcomes_1800": [
+    {"task_id": "imo2024_p1", "scores": [1, 1, 1], "proved_runs": 3},
+    {"task_id": "imo2024_p2", "scores": [1, 1, 1], "proved_runs": 3},
+    {"task_id": "imo2024_p3", "scores": [0, 0, 0], "proved_runs": 0},
+    {"task_id": "imo2024_p5", "scores": [0, 0, 0], "proved_runs": 0},
+    {"task_id": "imo2024_p6", "scores": [1, 1, 0], "proved_runs": 2},
+    {"task_id": "uk2024_r1_p1", "scores": [1, 1, 1], "proved_runs": 3},
+    {"task_id": "uk2024_r1_p2", "scores": [1, 1, 1], "proved_runs": 3},
+    {"task_id": "usa2024_p2", "scores": [0, 0, 0], "proved_runs": 0},
+    {"task_id": "imo2023_p2_v2", "scores": [0, 0, 0], "proved_runs": 0},
+    {"task_id": "imo2023_p3", "scores": [0, 0, 0], "proved_runs": 0},
+    {"task_id": "imo2023_p4", "scores": [1, 1, 1], "proved_runs": 3},
+    {"task_id": "imo2023_p5", "scores": [1, 1, 0], "proved_runs": 2}
+  ],
+  "limitations": [
+    "Three repeats per arm; descriptive comparison, not a significance estimate.",
+    "Judge probe infrastructure errors are reported separately from mathematical score.",
+    "Local Judge/runtime/HOME/ports/output were isolated and runs were serialized; external provider capacity was shared."
+  ]
+}

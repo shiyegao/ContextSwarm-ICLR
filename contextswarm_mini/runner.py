@@ -606,7 +606,13 @@ def _run_solver_with_recovery(
     deadline: float,
     cancel_event: Any | None,
 ) -> AgentResult:
-    """Apply the common persisted-session recovery contract to a solver."""
+    """Apply the common persisted-session recovery contract to a solver.
+
+    The shared boundary retries only abnormal, non-timeout process/invocation
+    failures.  A Pi timeout or runner-owned intentional cancellation is
+    terminal for this logical actor; the CPS scheduler may still admit a fresh
+    assignment after releasing the finished slot.
+    """
 
     max_restarts, delay_seconds = recovery_settings(config)
     return run_with_recovery(
@@ -632,8 +638,9 @@ def _agent_result_can_refill(
 
     This deliberately delegates to the same process-level classifier used by
     ``run_with_recovery``.  In particular, a Judge verdict is never passed
-    here, and cancellation/horizon results are terminal closeout rather than
-    replacement work.
+    here.  Timeout and intentional-cancellation results are terminal closeout
+    rather than same-actor replacement work; only an abnormal process result
+    can release a slot for the bounded refill path.
     """
 
     return is_recoverable_agent_failure(
@@ -2906,6 +2913,11 @@ def _run_mono(
             replacement_limit, _recovery_delay = recovery_settings(config)
             replacement_attempt = 0
             while True:
+                # ``run_with_recovery`` only relaunches abnormal,
+                # non-timeout process failures.  A timeout or runner-owned
+                # cancellation closes this Mono bundle; it must not trigger a
+                # same-actor refill.  (Unlike CPS, Mono has no independent
+                # scheduler slot from which to admit a fresh assignment.)
                 result = _run_solver_with_recovery(
                     config,
                     logger,
@@ -3402,10 +3414,12 @@ def _run_elastic_cps(
             run_horizon_is_limiter = deadline <= policy_deadline
             # The allocation policy agent is still an agent process.  Give it
             # the same bounded outer recovery boundary as solver workers so a
-            # transient coordinator/process exit does not turn one released
-            # slot into an avoidable policy failure.  The local policy timeout
-            # remains fixed; retries consume that same budget and never extend
-            # the experiment horizon.
+            # transient, non-timeout coordinator/process exit does not turn
+            # one released slot into an avoidable policy failure.  A local
+            # policy/task timeout (``timed_out=True``) or runner cancellation
+            # is terminal for this logical scheduler actor and is never
+            # retried by the outer wrapper; allocator fallback/slot release
+            # semantics remain unchanged.
             result = _run_solver_with_recovery(
                 config,
                 logger,
@@ -3428,7 +3442,9 @@ def _run_elastic_cps(
             # ``scheduler_deadline`` also includes the per-decision policy
             # timeout.  That timeout is a normal scheduler fallback, not the
             # experiment horizon; keep the distinction after the generic
-            # recovery boundary has marked a late result as terminal.
+            # recovery boundary has marked the result terminal.  It is not an
+            # outer recovery opportunity, even though a later allocation cycle
+            # may still admit fresh work while the arm has time remaining.
             if not run_horizon_is_limiter and result.run_horizon_reached:
                 result.run_horizon_reached = False
         result.decision_index = index
@@ -5125,10 +5141,13 @@ def _run_task_workers(
         expected_contract = _expected_task_contract(evaluator, task)
         allow_mock_provenance = _allows_mock_provenance(evaluator)
         candidate_path = _candidate_path(workdir, task)
-        # A process/session failure which exhausts its in-session recovery
-        # budget releases this task's slot.  Refill it with a bounded,
-        # communication-free replacement while the fixed arm horizon remains.
-        # The replacement keeps the same actor/episode and workspace so Pi can
+        # An abnormal, non-timeout process/session failure which exhausts its
+        # in-session recovery budget releases this task's slot.  Refill it
+        # with a bounded, communication-free replacement while the fixed arm
+        # horizon remains.  Timeout and intentional-cancellation results do
+        # not enter this same-actor path; the outer CPS scheduler may still
+        # admit a fresh assignment after the lease is released.  The abnormal
+        # replacement keeps the same actor/episode and workspace so Pi can
         # resume persisted state; candidate Judge verdicts never enter this
         # path.  One replacement per configured episode is sufficient to avoid
         # an unbounded retry loop while still satisfying the refill contract.
@@ -5333,9 +5352,9 @@ def _run_task_workers(
                 credit = early_credit if early_credit and early_credit.episode == episode else None
             if result.returncode != 0 and credit is None:
                 # Keep prior best progress and make the failed attempt visible
-                # without turning it into a candidate Judge retry.  The
-                # horizon/cancellation path is normal closeout, so no refill is
-                # scheduled after it.
+                # without turning it into a candidate Judge retry.  Timeout,
+                # horizon, and intentional-cancellation paths are normal
+                # closeout, so no same-actor refill is scheduled after them.
                 if _agent_result_can_refill(
                     result,
                     deadline=deadline,

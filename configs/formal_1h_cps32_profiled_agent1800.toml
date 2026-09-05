@@ -1,0 +1,43 @@
+extends = ["formal_1h_bridge.toml"]
+
+# Comparison arm for the recovery-no-timeout experiment.  The only runtime
+# change relative to the registered CPS32 arm is the per-Pi-agent wall-time
+# ceiling: one uninterrupted 1800-second invocation.  Keep this manifest
+# standalone so it can be validated from the repository's current main branch;
+# provider and Judge capabilities are still injected by the launcher.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-agent1800"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 32
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+time_limit_seconds = 3600
+
+[allocation]
+policy = "uniform"
+# Keep the allocator decision deadline fixed while changing only the Pi
+# process wall-time ceiling below.
+agent_timeout_seconds = 900
+
+[pi]
+timeout_seconds = 1800
+
+[aisw]
+max_in_flight = 32
+
+[lean]
+timeout_seconds = 300
+max_lifecycle_seconds = 4500
+max_concurrent_evaluations = 32
+require_result_cache_disabled = true
+
+[formal_tools]
+require_decl_index = false
+
+[docker]
+memory_mb = 32768
+network = "host"
