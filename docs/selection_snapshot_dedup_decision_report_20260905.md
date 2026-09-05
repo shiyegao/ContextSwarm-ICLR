@@ -89,10 +89,10 @@ child 文本的理论重复量是 12,043,000 B；compact file 的回收量略有
 | focused selection/artifact suite | 最终 PR 分支记录 `114/114` 通过 | 覆盖 fresh schema、legacy reopen、retry/conflict、export/validator、rollback、FK/index 和并发迁移路径 |
 | static checks | `py_compile`、`compileall`、`git diff --check` 通过 | 仅是静态/格式门禁 |
 | mock smoke | exit `0` | 只验证编排 plumbing，不是 real workload |
-| authoritative full discovery（实现 exact head） | `672` tests，`1` skipped，`OK` | 记录于独立、串行、唯一输出目录 |
-| rebase 后 target-main discovery | `708` tests，`1` skipped，`2` 个 timing-sensitive failures | 一个在目标 main 基线可复现，另一个隔离重跑通过；不能表述为 CI 全绿，也不归因于本次字段去重 |
+| authoritative full discovery（实现 exact head） | `672` tests，`1` skipped，`OK` | 历史 exact-head 证据，记录于独立、串行、唯一输出目录 |
+| 当前 PR/report worktree 重跑 | `708` tests，`1` skipped，`OK` | 使用磁盘支持的独立 `TMPDIR`；早先同一套 timing-sensitive 测试曾出现 2 个失败，当前重跑通过 |
 
-这些测试的“通过”只说明代码、迁移和离线行为满足检查；它不表示任何生产数据库已经执行迁移，也不表示 PR 已 merge/release/deploy。
+这些测试的“通过”只说明当前 checkout 的代码、迁移和离线行为满足检查；历史 timing-sensitive 波动仍是环境边界。它不表示任何生产数据库已经执行迁移，也不表示 PR 已 merge/release/deploy。
 
 ### 4. 历史证据、限制与下一步
 

@@ -72,6 +72,11 @@
       "passed": 672,
       "skipped": 1
     },
+    "current_report_worktree_full_discovery": {
+      "tests": 708,
+      "passed": 708,
+      "skipped": 1
+    },
     "mock_smoke_exit_code": 0,
     "static_checks": ["py_compile", "compileall", "git_diff_check"]
   },
