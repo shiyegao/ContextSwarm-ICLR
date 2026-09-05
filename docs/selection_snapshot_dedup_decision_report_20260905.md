@@ -116,6 +116,7 @@ child 文本的理论重复量是 12,043,000 B；compact file 的回收量略有
 - [`selection_artifacts.py`](../contextswarm_mini/selection_artifacts.py)
 - [`test_selection_store_candidates.py`](../tests/test_selection_store_candidates.py)
 - [`test_selection_artifacts_trace.py`](../tests/test_selection_artifacts_trace.py)
+- [脱敏证据摘要](selection_snapshot_dedup_evidence.json)
 
 脱敏 owner-only 原始证据（仅在实验工作站可访问，不复制到仓库）：
 

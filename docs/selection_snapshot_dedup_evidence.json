@@ -1,0 +1,95 @@
+{
+  "schema_version": "contextswarm_selection_snapshot_dedup_evidence_v1",
+  "scope": {
+    "selection_scope": "one search_event/selection",
+    "cross_selection_dedup": false,
+    "real_workload": false
+  },
+  "implementation": {
+    "source_commit": "8432d83b9b3f14f0a7367c47557826a3941269bc",
+    "pull_request": "https://github.com/nustarai/ContextSwarm-ICLR/pull/48"
+  },
+  "historical_context": {
+    "search_events": 895,
+    "candidate_rows": 128205,
+    "child_watermark_bytes": 834667185,
+    "parent_watermark_bytes": 4537892,
+    "parent_child_mismatch_count": 0
+  },
+  "matched_storage_ab": {
+    "selection_count": 1,
+    "candidate_count": 1000,
+    "watermark_utf8_bytes": 12043,
+    "page_size_bytes": 4096,
+    "legacy_child_copy": {
+      "child_watermark_bytes": 12043000,
+      "parent_watermark_bytes": 12043,
+      "candidate_payload_bytes": 345890,
+      "feedback_snapshot_bytes": 49000,
+      "file_bytes_after_checkpoint_and_vacuum": 13402112,
+      "page_count": 3272,
+      "child_column_present": true
+    },
+    "parent_only_or_migrated": {
+      "child_watermark_bytes": 0,
+      "parent_watermark_bytes": 12043,
+      "candidate_payload_bytes": 345890,
+      "feedback_snapshot_bytes": 49000,
+      "file_bytes_after_checkpoint_and_vacuum": 1286144,
+      "page_count": 314,
+      "child_column_present": false
+    },
+    "file_bytes_reclaimed": 12115968,
+    "file_reclaimed_fraction": 0.904034,
+    "candidate_rows_preserved": true,
+    "replay_idempotent": true,
+    "exports": {
+      "record_count_each": 1005,
+      "bytes_each": 878454,
+      "sha256_each": "501da2f524a09b75895cb3f99ff098e7e5756196e313c3e4cade729cd01d39fc",
+      "bytes_equal": true,
+      "sha256_equal": true,
+      "validator_summaries_equal": true
+    }
+  },
+  "migration_concurrency_probe": {
+    "legacy_shape": "child watermark column present; parent identity columns absent",
+    "openers": 16,
+    "successful_openers": 16,
+    "errors": [],
+    "candidate_rows_preserved": 2,
+    "parent_columns_present_after": true,
+    "child_column_present_after": false
+  },
+  "validation": {
+    "focused_selection_suite": {
+      "tests": 114,
+      "passed": 114,
+      "skipped": 0
+    },
+    "authoritative_full_discovery": {
+      "tests": 672,
+      "passed": 672,
+      "skipped": 1
+    },
+    "mock_smoke_exit_code": 0,
+    "static_checks": ["py_compile", "compileall", "git_diff_check"]
+  },
+  "not_measured": [
+    "production_database_migration",
+    "latency",
+    "throughput",
+    "wal_growth",
+    "lock_wait",
+    "downgrade"
+  ],
+  "owner_only_artifact_names": [
+    "CS-20260901-06/evidence/size_experiment.py",
+    "CS-20260901-06/evidence/size_experiment_run/result.json",
+    "CS-20260901-06/evidence/parent-race-final2.txt",
+    "CS-20260901-06/evidence/review/ab.md",
+    "CS-20260901-06/evidence/review/findings.md",
+    "CS-20260901-06/evidence/full-unittest-authoritative-root.txt",
+    "CS-20260901-06/evidence/impl-handoff.md"
+  ]
+}
