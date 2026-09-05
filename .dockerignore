@@ -2,7 +2,10 @@
 __pycache__
 *.py[cod]
 .pytest_cache
-runs
+# Keep generated run data out of the image, but retain the tracked operator
+# manifest used by the formal 1x1 launch contract.
+runs/*
+!runs/operator-private-figure3-formal-random-1x1.toml
 .smoke-runs
 output
 9585_ContextSwarm_Scaling_Cont.pdf

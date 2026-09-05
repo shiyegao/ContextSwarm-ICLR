@@ -1,0 +1,23 @@
+extends = ["cps96.toml"]
+
+# High-capacity selection observation.  This keeps the C96 solver and Judge
+# contract unchanged while enabling the policy-neutral selector so writer-lock
+# and full selection-stage costs can be checked at the largest safe arm used
+# in the first profiling matrix.
+[experiment]
+name = "capacity-selection-coding-cps96"
+output_root = "runs/selection_coding/cps96"
+
+[selection]
+enabled = true
+selector_name = "random"
+selector_version = "capacity_profile_v1"
+visibility = "project_shared"
+trace_slot_limit = 8
+context_token_budget = 4096
+tokenizer = "utf8_bytes_ceil_div4_v1"
+seed = 0
+tie_break = "trace_id_asc"
+policy_params = { sample_without_replacement = true }
+direct_messages = false
+candidate_transfer = false

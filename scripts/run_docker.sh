@@ -360,6 +360,23 @@ if [[ -n "${LEAN_AUTH_TOKEN:-}" ]]; then
   DOCKER_ARGS+=(-e LEAN_AUTH_TOKEN)
 fi
 
+# Profiling is an explicit opt-in.  Forward only the allow-listed variable
+# names so their values (including a possibly private path) never enter the
+# Docker argv or shell traces.  The profiler validates that PROFILE_PATH stays
+# inside the mounted run directory after the container starts.
+for profiling_env in \
+  CONTEXTSWARM_PROFILE \
+  CONTEXTSWARM_RESOURCE_PROFILING \
+  CONTEXTSWARM_PROFILING \
+  CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS \
+  CONTEXTSWARM_PROFILE_INTERVAL_SECONDS \
+  CONTEXTSWARM_PROFILE_PATH
+do
+  if [[ -n "${!profiling_env:-}" ]]; then
+    DOCKER_ARGS+=(-e "${profiling_env}")
+  fi
+done
+
 if (( MOCK == 0 )); then
   if [[ ! -x "${AISW_BINARY}" ]]; then
     echo "NuRouter/AISW Linux ELF not found: ${AISW_BINARY}" >&2

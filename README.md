@@ -51,6 +51,34 @@ workers/mono/tasks/<task>/result.lean # mono
 
 `--mock-agent` 只验证编排和产物，不代表论文分数。
 
+## 可选资源 profiling（默认关闭）
+
+设置 `CONTEXTSWARM_PROFILE=1` 才会在 run 目录生成受权限保护的
+`profiling.jsonl`；默认路径不会创建 profiling 文件、sampler 线程或额外的
+profiling 写入。事件只保留低基数身份、计数器和资源标量，不写 prompt、candidate、
+secret、provider response 或主机路径。采样周期有界，artifact/JSONL 统计以低频快照
+和单行追加写入控制观测自身的开销。
+
+`resource.sample` 是包含 runner/shared 进程树的 run-level aggregate；注册的
+`resource.process` 行则按 solver/attempt 的 task 与 actor 归属，并可包含该根进程的
+descendants。两者的进程集合可能重叠，不能把 runner aggregate 与 solver rows 直接
+相加；aggregate 用于整体峰值，solver rows 用于归属分析，无法安全分摊的部分单列。
+在 cgroup v2 下优先读取当前进程 `0::` scope，只有 scope 不可用时才回退到层级根。
+
+六个主目标及独立 `record_search_lock` 诊断的事件覆盖矩阵、Agent/wrapper 分界、SQLite
+锁/WAL 解读、互斥分支和一次运行的限制见
+[`docs/profiling_metric_contract.md`](docs/profiling_metric_contract.md)；profile 结束后用
+只读的 [`scripts/audit_profiling.py`](scripts/audit_profiling.py) 检查 coverage、真实性
+等级和退出码。一次 profiling-on 真实 run 的字段清单见
+[`docs/profiling_one_run_checklist.md`](docs/profiling_one_run_checklist.md)；实际运行前的参数/证据交接约束见
+[`docs/profiling_dispatch_checklist.md`](docs/profiling_dispatch_checklist.md)。
+
+外部 formal Judge/Lean backend、router 和 worker 的宿主进程不属于 runner 的进程树，
+需要单独使用只读的 `scripts/external_resource_sampler.py` 采样。它要求操作者显式提供
+各层 root PID，输出 baseline、run-window、delta、RSS/PSS、累计及窗口 CPU、throttle、
+PID/线程和 cgroup counters；不会读取命令行/环境、发送请求或把 warm Judge 内存算到 agent。
+完整字段、边界和离线测试见 [`docs/external_resource_sampler.md`](docs/external_resource_sampler.md)。
+
 ## Docker + NuRouter/AISW Pi
 
 先构建镜像：
@@ -223,9 +251,14 @@ provider circuit breaker 或使 formal artifact 失格。
 如果整个 Pi RPC/session 进程在收到 `agent_settled` 前异常退出，`[pi.recovery]`
 提供 runner 级的有界恢复：默认在原 horizon 内重启一次，沿用同一个逻辑
 `actor/task/episode`、workspace、candidate 和确定性的 Pi session，因此已有进度
-可以继续使用。退避时间计入 horizon；正常满分、horizon 到点、runner 主动取消以及
-Judge 返回的候选 verdict 不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会
-写入 `events.jsonl`，便于区分 agent 进程故障与候选本身的 PE/WA/超时。
+可以继续使用。只有非超时、非主动取消的异常进程/调用失败才会进入这层恢复；Pi
+任务超时（包括 inner Pi timeout）、runner 主动取消和正常 horizon closeout 都是该
+逻辑 actor 的终态，不会重启或同 actor refill。CPS 仍可在释放 slot 后由调度器接纳
+新的 assignment；这不是对已停止 actor 的 recovery。退避时间计入 horizon；Judge
+返回的候选 verdict 也不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会写入
+`events.jsonl`，其中耗尽原因区分 `task_timeout`、`intentional_cancel`、`horizon`
+、`runner_failure`、`remote_settlement_unconfirmed` 和异常/重试预算路径，便于区分
+agent 进程故障与候选本身的 PE/WA/超时。
 
 每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
 session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发
@@ -309,10 +342,15 @@ agent。这样，各模式在 horizon 收口时选中并冻结的候选，不会
 
 paper-facing manifest 统一将 `[lean].max_concurrent_evaluations` 设为 4；建议同时给
 独立 Goedel-Prover Judge 配置至少 4 个 worker。该值应当始终和 Judge worker/
-内存容量一起调整。`[lean].timeout_seconds`（默认 300 秒）是 Judge 单个后端
-命令的执行预算，不是提交到终态的总 wall time：合法 job lifecycle 还可能包含
+内存容量一起调整。`[lean].timeout_seconds`（默认 300 秒）是省略 Agent 提议时
+Judge 单个后端命令的执行预算，不是提交到终态的总 wall time：合法 job lifecycle 还可能包含
 queue、冷 REPL header/body 以及 formal finalization。它也不是 solver horizon 或
-整个 closeout 的总预算。`[lean].max_lifecycle_seconds`（paper manifest 为 3600）
+整个 closeout 的总预算。启用 Agent timeout capability 时，`timeout_seconds` 的默认
+广告范围是 5–300 秒，但 300 只是默认值；实际 Agent 上限跟随 `[judge].timeout_seconds`
+（或 `[lean].timeout_seconds` fallback），prompt、tool description 和 broker 会使用同一
+配置值。启用该能力且开启 formal helper 时，`formal_tools.command_timeout_seconds` 会至少
+保留该 cap 外加 120 秒的 helper handoff margin，避免 Pi 的 Bash guard 先于 Judge budget
+结束；默认 300 秒对应历史 420 秒。`[lean].max_lifecycle_seconds`（paper manifest 为 3600）
 是客户端防御畸形 receipt 的显式安全上界，不会缩短 Judge 正常公布的预算。
 
 如果 AISW binary 或 node config 不在默认路径：
@@ -422,7 +460,13 @@ lifecycle receipt 会 fail closed，不会造成无限轮询。客户端主动�
 `REMOTE_SETTLEMENT_UNCONFIRMED` 并停止后续 admission。Judge 明确返回的
 pre-admission overload 会在 30 秒
 admission budget 内有界重试；已经排队后才返回的 terminal、retryable
-`rejected_overloaded` 至多重交一次 whole job。结果不明的 socket/proxy 失败不会
+`rejected_overloaded` 至多重交一次 whole job。启用 Agent timeout capability 时，
+`judge_check`/`evaluate_local` 的 `timeout_seconds` 是一次逻辑调用的累计总预算；
+安全 retry 仍可发生，但每个 fresh backend job 只拿到绝对 deadline 的剩余时间，
+因此 retry 不会把名义预算乘倍。这个 retry 留在同一个 broker handler/evaluator
+gate 内，不回到 allocator，也不新建 Agent session。`evaluate_local` 的每个 fresh
+retry 还要重新占用该 task 的 `evaluate_backend_jobs_per_task` 单位；配额不足时
+retry 会 fail closed，并在反馈中标注 `retry_blocked_reason`。结果不明的 socket/proxy 失败不会
 盲目重交，以免复制仍在运行的 job。Judge 的 `error_kind`、
 `terminal_reason`、queue/execution timing 会保留在安全摘要中，以区分证明错误、
 执行超时、资源限制、过载和基础设施故障。只有 canonical `PROVED` / `AC`

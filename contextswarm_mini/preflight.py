@@ -179,8 +179,12 @@ def run_preflight(
         kernel_verdict: Verdict | None = None
         if strict_formal:
             kernel_verdict = _kernel_probe(evaluator, output_dir)
-            report["lean"]["kernel_probe"] = _safe_kernel_probe(kernel_verdict)
-            _validate_kernel_probe(kernel_verdict)
+            report["lean"]["kernel_probe"] = _safe_kernel_probe(
+                kernel_verdict, timeout_max_seconds=config.lean_timeout_seconds
+            )
+            _validate_kernel_probe(
+                kernel_verdict, timeout_max_seconds=config.lean_timeout_seconds
+            )
         health_revision = _revision_from_payload(report["lean"])
         kernel_revision = (
             _revision_from_payload(kernel_verdict.response)
@@ -557,8 +561,12 @@ def _kernel_probe(evaluator: Any, output_dir: Path) -> Verdict:
     raise PreflightError("Lean kernel probe returned an invalid verdict")
 
 
-def _safe_kernel_probe(verdict: Verdict) -> dict[str, Any]:
-    response = safe_worker_response(verdict.response)
+def _safe_kernel_probe(
+    verdict: Verdict, *, timeout_max_seconds: int | float | None = None
+) -> dict[str, Any]:
+    response = safe_worker_response(
+        verdict.response, timeout_max_seconds=timeout_max_seconds
+    )
     result: dict[str, Any] = {
         "status": sanitize_worker_text(verdict.status, 64),
         "elapsed_seconds": round(max(0.0, float(verdict.elapsed_seconds)), 6),
@@ -570,7 +578,9 @@ def _safe_kernel_probe(verdict: Verdict) -> dict[str, Any]:
     return result
 
 
-def _validate_kernel_probe(verdict: Verdict) -> None:
+def _validate_kernel_probe(
+    verdict: Verdict, *, timeout_max_seconds: int | float | None = None
+) -> None:
     status = str(verdict.status or "").upper()
     if status not in {
         "PROVED",
@@ -580,7 +590,9 @@ def _validate_kernel_probe(verdict: Verdict) -> None:
         "COMPLETED",
     }:
         raise PreflightError("Lean kernel probe did not reach a usable terminal state")
-    response = safe_worker_response(verdict.response)
+    response = safe_worker_response(
+        verdict.response, timeout_max_seconds=timeout_max_seconds
+    )
     # A terminal-looking status alone is not evidence that Lean elaborated the
     # probe.  Require the explicit validity bit (the probe source contains no
     # placeholder, so either accepted validity field is sufficient for older

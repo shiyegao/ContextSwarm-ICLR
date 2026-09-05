@@ -1,0 +1,41 @@
+extends = ["formal_1h_bridge.toml"]
+
+# Operator-local one-hour profiling arm.  It preserves the registered
+# MathOlympiadBench/formal/Model contract while matching the reference
+# population target of 32.  Provider and Judge capabilities remain injected
+# by the launcher; no endpoint or credential belongs in this manifest.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 32
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+
+[allocation]
+policy = "uniform"
+# Match the reference worker wall-time ceiling while retaining the fixed
+# one-hour outer horizon.
+agent_timeout_seconds = 900
+
+[pi]
+timeout_seconds = 900
+
+[aisw]
+max_in_flight = 32
+
+[lean]
+max_concurrent_evaluations = 32
+require_result_cache_disabled = true
+
+[formal_tools]
+# The local Goedel v49 service has no revision-matched declaration index.
+# Keep helper diagnostics enabled without claiming declaration-search parity.
+require_decl_index = false
+
+[docker]
+memory_mb = 32768
+network = "host"

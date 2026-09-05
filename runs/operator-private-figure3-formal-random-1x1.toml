@@ -1,0 +1,53 @@
+# Operator-private scale-down of the checked-in Figure 3 formal/random arm.
+# This changes only workload size and runtime ceilings.  The original
+# MathOlympiadBench dataset, CPS/blackboard mode, Uniform Refill allocator,
+# random selector, formal tools, real Pi transport, and formal Judge contract
+# are inherited unchanged from configs/figure3_formal/random.toml.
+extends = ["../configs/figure3_formal/random.toml"]
+
+[experiment]
+name = "operator-private-figure3-formal-random-1x1"
+output_root = "/home/ubuntu/workspace/.workspace/builds/original-formal-1x1-20260829/runs/figure3-formal-random-1x1"
+max_parallel = 1
+initial_agents_per_task = 1
+episodes_per_task = 1
+max_tasks = 1
+time_limit_seconds = 300
+
+[allocation]
+piece_limit_per_task = 1
+agent_timeout_seconds = 300
+
+[pi]
+timeout_seconds = 300
+
+[aisw]
+max_in_flight = 1
+
+[lean]
+timeout_seconds = 300
+# Keep the parent Figure 3 lifecycle safety contract.  The 300-second value
+# above is the per-evaluation timeout; the Judge advertises a larger
+# queue/recovery lifecycle window (observed 1460s), so the scale-only arm must
+# retain the parent 3600-second client cap rather than fail during closeout.
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 1
+# Preserve the effective Figure 3 formal/random contract.  The development
+# base intentionally leaves the result-cache gate disabled; this faithful
+# scale-down must not silently become the separate strict preflight profile.
+require_result_cache_disabled = false
+
+[formal_tools]
+# Preserve the effective Figure 3 formal/random contract (false).  An
+# operator-supplied declaration index is still available to the real formal
+# tool surface, but it is not promoted to an admission gate in this arm.
+require_decl_index = false
+decl_index = "/home/ubuntu/workspace/.workspace/builds/formal-runtime-1x1-20260829/decl-index.sqlite3"
+decl_index_sha256 = "08087add4f3d897887938167a71c0f7b495a1b8ec48fdc5c1a6dc8b816c85201"
+mathlib_revision = "v4.9.0"
+
+[selection]
+trace_slot_limit = 1
+
+[docker]
+image = "contextswarm-iclr:original-formal-1x1-20260829"

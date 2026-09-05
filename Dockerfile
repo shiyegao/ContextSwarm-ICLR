@@ -1,9 +1,16 @@
 # Minimal experiment image. NuRouter/AISW is mounted read-only at run time;
 # credentials and coordinator configuration never enter this image.
-FROM node:22-bookworm-slim
+# Bookworm's glibc (2.36) cannot load the host NuRouter ELF (GLIBC_2.39).
+# Trixie keeps the official Node 22 image while providing glibc 2.41, so the
+# read-only mounted real NuRouter/Pi launcher remains executable as non-root.
+FROM node:22-trixie-slim
 
-ARG PI_VERSION=0.84.2
-ARG CODEX_VERSION=0.148.0
+# Use the operator's currently installed real clients for this freeze.  The
+# host-side launch still mounts the real NuRouter binary and node config; these
+# npm packages provide the in-image Pi/CodeX executables used by the managed
+# launcher.  Both versions remain overrideable at build time.
+ARG PI_VERSION=0.84.3
+ARG CODEX_VERSION=0.150.1
 ARG CONTEXTSWARM_SOURCE_COMMIT=unknown
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

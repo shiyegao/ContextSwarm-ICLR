@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from .models import Task
+from .timeout_policy import agent_timeout_bounds
 
 
 FORMAL_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
@@ -167,6 +168,96 @@ Do not inspect helper source, alter capability metadata, or use any other shell
 command."""
 
 
+def _scaled_timeout_value(cap: int, floor: int, ratio: float) -> int:
+    """Scale a heuristic by the configured cap while preserving its bounds."""
+
+    # Match JavaScript ``Math.round`` used by the Pi extension (positive
+    # values only, so adding 0.5 gives the same half-up result).
+    return max(floor, min(cap, int(cap * ratio + 0.5)))
+
+
+def _timeout_tier(low: int, high: int, *, ratio_label: str) -> str:
+    """Render a heuristic tier without claiming a percentage after rounding."""
+
+    rendered = f"{low}–{high} seconds"
+    if low == high:
+        return f"{rendered} (rounded for this configured cap)"
+    return f"{rendered} ({ratio_label} of the cap)"
+
+
+def _agent_timeout_instructions(
+    enabled: bool,
+    *,
+    formal: bool,
+    formal_tools_enabled: bool = False,
+    configured_timeout_seconds: int | float | None = None,
+) -> str:
+    """Render the opt-in worker guidance without changing baseline prompts."""
+
+    if not enabled:
+        return ""
+    bounds = agent_timeout_bounds(configured_timeout_seconds)
+    floor = bounds.min_seconds
+    cap = bounds.max_seconds
+    sanity_low = floor
+    sanity_high = _scaled_timeout_value(cap, floor, 0.05)
+    routine_low = _scaled_timeout_value(cap, floor, 0.10)
+    routine_high = _scaled_timeout_value(cap, floor, 0.20)
+    heavy_low = _scaled_timeout_value(cap, floor, 0.40)
+    heavy_high = _scaled_timeout_value(cap, floor, 0.60)
+    routine_example = routine_high
+    routine_guidance = _timeout_tier(
+        routine_low, routine_high, ratio_label="10–20%"
+    )
+    heavy_guidance = _timeout_tier(
+        heavy_low, heavy_high, ratio_label="40–60%"
+    )
+    sanity_guidance = _timeout_tier(
+        sanity_low, sanity_high, ratio_label="about 5% or less"
+    )
+    helper = (
+        " For formal diagnostics, `python3 evaluate.py --timeout N` sends the same budget."
+        if formal and formal_tools_enabled
+        else ""
+    )
+    example = f'`{{"timeout_seconds": {routine_example}}}`'
+    if formal and formal_tools_enabled:
+        example += f" and the formal helper can use `python3 evaluate.py --timeout {routine_example}`"
+    return f"""Agent-proposed validation budget (enabled for this run):
+- `judge_check` accepts an optional integer `timeout_seconds` in the advertised
+  range {floor}–{cap} seconds.{helper} The runner
+  clamps values outside that range (and its hard evaluator ceiling) before
+  submission; the effective value is reported in the bounded receipt.
+- In this treatment, normally include a value on every validation call so the
+  experiment can observe your estimate; omit it only when you deliberately
+  choose the legacy timeout/retry behavior. For example, a routine check can use
+  {example}.
+- This is one cumulative logical validation budget across all evaluator retries.
+  The runner owns one absolute deadline: a first attempt that fails abnormally
+  after about one tenth of the selected budget leaves the remainder for a safe
+  retry; an attempt that consumes the deadline leaves no retry budget.
+  Retry count is therefore independent of the chosen seconds, and retries do
+  not multiply the requested timeout. The budget includes broker admission and
+  evaluator work, but it is not the outer experiment horizon or provider/Pi
+  timeout. A short, bounded remote-settlement cleanup grace may make the final
+  HTTP receipt arrive slightly after the deadline; it is recorded separately.
+  Omitting the field keeps the configured legacy timeout/retry policy.
+- As a starting heuristic relative to the configured cap ({cap} seconds), use
+  about {routine_guidance} for routine incremental checks; {heavy_guidance} for
+  a promising candidate with heavy imports, elaboration, or resource-sensitive
+  code; and reserve the full {cap} seconds only for a genuinely likely
+  near-complete but known-slow check. Use about {sanity_guidance} only for
+  cheap sanity feedback after an obvious edit, not for the first checkpoint or
+  immediately after changing imports/large definitions.
+- `EXECUTION_TIMEOUT` is inconclusive candidate feedback, not `VERIFY_FAIL`,
+  proof of correctness, or permission to run a local checker. After a timeout,
+  inspect the feedback and make a material edit (or leave the best candidate)
+  before trying again. Candidate-independent transport/runtime failures may be
+  retried automatically while the same cumulative budget remains; deterministic
+  verdicts and timeout/cancellation results are not automatically replayed.
+  Keep calls serial and respect the session budget."""
+
+
 def _is_coding_task(task: Task) -> bool:
     """Whether ``task`` is a C++ Judge task (formal remains the default)."""
 
@@ -193,6 +284,8 @@ def build_task_prompt(
     episode: int,
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
+    agent_timeout_enabled: bool = False,
+    agent_timeout_cap_seconds: int | float | None = None,
     direct_messages: bool = True,
     selection_enabled: bool = False,
     digest: str = "",
@@ -223,6 +316,13 @@ or a local verification process.
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 
+{_agent_timeout_instructions(
+    agent_timeout_enabled,
+    formal=not coding,
+    formal_tools_enabled=formal_tools_enabled and not coding,
+    configured_timeout_seconds=agent_timeout_cap_seconds,
+)}
+
 Relevant shared context (possibly empty):
 ---
 {context}
@@ -240,6 +340,8 @@ def build_mono_prompt(
     workspace: str,
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
+    agent_timeout_enabled: bool = False,
+    agent_timeout_cap_seconds: int | float | None = None,
     direct_messages: bool = True,
     selection_enabled: bool = False,
 ) -> str:
@@ -276,6 +378,13 @@ Parallel worker may omit `task_id`, but Mono may not.
 {_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
+
+{_agent_timeout_instructions(
+    agent_timeout_enabled,
+    formal=not coding,
+    formal_tools_enabled=formal_tools_enabled and not coding,
+    configured_timeout_seconds=agent_timeout_cap_seconds,
+)}
 
 Use the available wall-clock budget on concrete {noun} construction. Leave every
 task directory with its best candidate, even if some targets remain incomplete.

@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${CONTEXTSWARM_MINI_IMAGE:-contextswarm-iclr-mini:latest}"
-PI_VERSION="${CONTEXTSWARM_MINI_PI_VERSION:-0.84.2}"
-CODEX_VERSION="${CONTEXTSWARM_MINI_CODEX_VERSION:-0.148.0}"
+PI_VERSION="${CONTEXTSWARM_MINI_PI_VERSION:-0.84.3}"
+CODEX_VERSION="${CONTEXTSWARM_MINI_CODEX_VERSION:-0.150.1}"
 cd "${ROOT_DIR}"
 
 # A paper-facing image must be an exact Git snapshot.  Refuse an untracked or

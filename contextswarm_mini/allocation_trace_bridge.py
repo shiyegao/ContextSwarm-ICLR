@@ -26,7 +26,10 @@ import inspect
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
+import threading
+import time
 from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence
 
 from .allocation_projection import (
@@ -63,6 +66,76 @@ _REQUIRED_SELECTION_TABLES = frozenset(
     }
 )
 _TRACE_POLICIES = frozenset({"trace_state", "llm_scheduler"})
+_KNOWN_FALLBACK_REASONS = frozenset(
+    {
+        "trace_store_unavailable",
+        "invalid_reference_time",
+        "invalid_ordinary_outcome_id",
+    }
+)
+_PROJECTION_ERROR_REASON_RE = re.compile(
+    r"^projection_unavailable:[A-Za-z_][A-Za-z0-9_]{0,63}$"
+)
+_PROFILE_SNAPSHOT_HISTORY_LIMIT = 4096
+
+
+class _NoopContext:
+    """Tiny context manager used by the disabled profiling fast path."""
+
+    def __enter__(self) -> "_NoopContext":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        return None
+
+
+class _FailOpenContext:
+    """Wrap an injected profiler context without changing bridge semantics."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __enter__(self) -> Any:
+        try:
+            return self._inner.__enter__()
+        except BaseException:
+            # Profiling is observational.  A broken sink must never turn a
+            # usable trace projection into an allocator fallback.
+            return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            self._inner.__exit__(exc_type, exc, tb)
+        except BaseException:
+            return None
+
+
+class _SnapshotRecordValidator:
+    """Incrementally validate paged records in O(records), not O(pages*records)."""
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, ...], dict[str, Any]] = {}
+
+    def add(self, records: Sequence[Any]) -> tuple[Any, ...]:
+        """Validate a page and return only records not seen on earlier pages.
+
+        A transport retry may replay an otherwise valid page.  Keep the first
+        occurrence for projection and bound accounting, while still rejecting
+        a stable identity whose topology changed between pages.
+        """
+
+        unique: list[Any] = []
+        for raw in records:
+            record = _projection_record(raw)
+            identity = _projection_record_identity(record)
+            previous = self._seen.get(identity)
+            signature = _projection_signature(record)
+            if previous is not None and previous != signature:
+                raise ValueError("snapshot contains contradictory duplicate records")
+            if previous is None:
+                self._seen[identity] = signature
+                unique.append(raw)
+        return tuple(unique)
 
 
 class _ProjectionSource(Protocol):
@@ -339,6 +412,11 @@ class AllocationTraceView:
     complete: bool
     fallback_reason: str = ""
     trace_references: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Source watermarks stay opaque.  Namespace-bound hashes let profiling
+    # correlate repeated reads without leaking a private cursor or path-like
+    # source value into runner state.
+    trace_watermark_sha256: str = ""
+    source_snapshot_sha256: str = ""
 
     def __post_init__(self) -> None:
         if not self.watermark or len(self.watermark) > 512:
@@ -353,6 +431,13 @@ class AllocationTraceView:
             raise ValueError("unsupported trace projection source")
         if not isinstance(self.complete, bool):
             raise ValueError("complete must be a boolean")
+        if self.fallback_reason:
+            safe_reason = _safe_fallback_reason(self.fallback_reason)
+            object.__setattr__(self, "fallback_reason", safe_reason)
+        for name in ("trace_watermark_sha256", "source_snapshot_sha256"):
+            value = getattr(self, name)
+            if value and not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"{name} must be a sha256 hex digest")
         task_ids = tuple(task_id for task_id, _values in self.trace_references)
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("trace reference task IDs must be unique")
@@ -423,10 +508,46 @@ def _canonical_sha(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _metadata_sha(value: Any, *, namespace: str) -> str:
+    """Hash a bounded source metadata value under an explicit namespace."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    if isinstance(value, Mapping):
+        # Mapping values here are constructed locally from already validated
+        # scalar watermarks; canonical encoding keeps the digest stable.
+        bounded = dict(value)
+    else:
+        bounded = str(value).strip()[:512]
+    return _canonical_sha({"schema": namespace, "value": bounded})
+
+
+
+
 def _bounded_reason(exc: BaseException) -> str:
     # Only the class is retained: exception messages can contain a private DB
     # path, SQL detail, or provider endpoint.
     return f"projection_unavailable:{type(exc).__name__}"[:128]
+
+
+def _safe_fallback_reason(reason: Any) -> str:
+    """Return a bounded diagnostic label without retaining arbitrary input.
+
+    ``TraceProjectionBridge.zero`` is a public helper and can be called by a
+    caller that has an exception message or another private value at hand.
+    Keeping the reason to a small label grammar prevents that value from
+    reaching either the immutable view or its watermark hash.  Internal
+    reasons produced by :func:`_bounded_reason` (for example
+    ``projection_unavailable:ValueError``) remain readable.
+    """
+
+    if isinstance(reason, str):
+        normalized = reason.strip()
+        if normalized in _KNOWN_FALLBACK_REASONS or _PROJECTION_ERROR_REASON_RE.fullmatch(
+            normalized
+        ):
+            return normalized
+    return "trace_store_unavailable"
 
 
 def _feedback_mapping(values: Mapping[str, Any] | None) -> dict[str, float]:
@@ -465,12 +586,28 @@ class SelectionStoreTraceSource:
         *,
         feedback_values: Mapping[str, Any] | None,
         max_records: int = 4096,
+        profiler: Any | None = None,
     ) -> None:
         if max_records <= 0:
             raise ValueError("max_records must be positive")
         self.store = store
         self.feedback_values = _feedback_mapping(feedback_values)
         self.max_records = int(max_records)
+        self.profiler = profiler if profiler is not None else getattr(store, "profiler", None)
+        try:
+            self._profiling_enabled = bool(
+                self.profiler is not None and getattr(self.profiler, "enabled", False)
+            )
+        except BaseException:
+            self._profiling_enabled = False
+
+    def _profile_event(self, event: str, **fields: Any) -> None:
+        if not self._profiling_enabled:
+            return
+        try:
+            self.profiler.emit(event, **fields)
+        except BaseException:
+            return
 
     @contextmanager
     def _read_db(self) -> Iterator[sqlite3.Connection]:
@@ -480,9 +617,21 @@ class SelectionStoreTraceSource:
             # exposes SelectionStore._db().  The latter enables WAL and can
             # mutate store metadata, which would violate this bridge's
             # read-only boundary.
-            uri = Path(path).resolve().as_uri() + "?mode=ro"
-            db = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
-            db.row_factory = sqlite3.Row
+            connect_started = time.monotonic() if self._profiling_enabled else 0.0
+            db: sqlite3.Connection | None = None
+            try:
+                uri = Path(path).resolve().as_uri() + "?mode=ro"
+                db = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+                db.row_factory = sqlite3.Row
+            finally:
+                if self._profiling_enabled:
+                    self._profile_event(
+                        "trace.bridge.sqlite.connect",
+                        db_operation="selection_store_projection",
+                        connect_seconds=max(0.0, time.monotonic() - connect_started),
+                        status="ok" if db is not None else "error",
+                    )
+            assert db is not None
             try:
                 db.execute("PRAGMA query_only=ON")
                 yield db
@@ -493,19 +642,65 @@ class SelectionStoreTraceSource:
         if callable(factory):
             # A protocol-only test double may have no path.  Keep this fallback
             # narrow; real SelectionStore instances always have a path.
+            connect_started = time.monotonic() if self._profiling_enabled else 0.0
             with factory() as db:
+                if self._profiling_enabled:
+                    self._profile_event(
+                        "trace.bridge.sqlite.connect",
+                        db_operation="selection_store_projection",
+                        connect_seconds=max(0.0, time.monotonic() - connect_started),
+                        status="ok",
+                    )
                 db.execute("PRAGMA query_only=ON")
                 yield db
             return
         raise TypeError("selection store has no read-only database surface")
 
-    @staticmethod
-    def _schema_ok(db: sqlite3.Connection) -> bool:
-        names = {
-            str(row[0])
-            for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        return _REQUIRED_SELECTION_TABLES.issubset(names)
+    def _read_query(
+        self,
+        db: sqlite3.Connection,
+        *,
+        query_name: str,
+        query_index: int,
+        statement: str,
+        parameters: Sequence[Any] = (),
+    ) -> tuple[list[sqlite3.Row], float, float]:
+        """Execute/fetch one logical query and emit its own terminal timing."""
+
+        query_started = time.monotonic() if self._profiling_enabled else 0.0
+        query_seconds = 0.0
+        fetch_seconds = 0.0
+        rows: list[sqlite3.Row] = []
+        status = "error"
+        try:
+            cursor = db.execute(statement, tuple(parameters))
+            if self._profiling_enabled:
+                query_seconds = max(0.0, time.monotonic() - query_started)
+                fetch_started = time.monotonic()
+                rows = cursor.fetchall()
+                fetch_seconds = max(0.0, time.monotonic() - fetch_started)
+            else:
+                rows = cursor.fetchall()
+            status = "ok"
+            return rows, query_seconds, fetch_seconds
+        finally:
+            if self._profiling_enabled:
+                # When execute itself fails, retain its attempted wall time in
+                # query_seconds so the terminal row still explains the gap.
+                if query_seconds <= 0.0:
+                    query_seconds = max(0.0, time.monotonic() - query_started)
+                self._profile_event(
+                    "trace.bridge.sqlite.query",
+                    db_operation="selection_store_projection",
+                    query_name=query_name,
+                    query_index=query_index,
+                    query_seconds=query_seconds,
+                    fetch_seconds=fetch_seconds,
+                    rows_scanned=len(rows),
+                    scan_scope="logical_result_rows",
+                    read_mode="pinned_transaction",
+                    status=status,
+                )
 
     def read_complete_records(
         self, task_ids: Sequence[str]
@@ -514,17 +709,37 @@ class SelectionStoreTraceSource:
         if not ordered:
             return (), _canonical_sha({"schema": "selection_store_v1", "records": []})
         placeholders = ",".join("?" for _ in ordered)
+        query_seconds = 0.0
+        fetch_seconds = 0.0
+        transaction_started = 0.0
+        transaction_finished = 0.0
+        read_scope_finished = 0.0
         with self._read_db() as db:
-            if not self._schema_ok(db):
+            read_scope_started = time.monotonic() if self._profiling_enabled else 0.0
+            schema_rows, elapsed, fetched = self._read_query(
+                db,
+                query_name="schema",
+                query_index=1,
+                statement="SELECT name FROM sqlite_master WHERE type='table'",
+            )
+            query_seconds += elapsed
+            fetch_seconds += fetched
+            names = {str(row[0]) for row in schema_rows}
+            if not _REQUIRED_SELECTION_TABLES.issubset(names):
                 raise ValueError("selection store schema is incompatible")
+            begin_started = time.monotonic() if self._profiling_enabled else 0.0
             db.execute("BEGIN")
+            transaction_started = begin_started
+            begin_seconds = (
+                max(0.0, time.monotonic() - begin_started)
+                if self._profiling_enabled
+                else 0.0
+            )
             try:
                 # Task attribution is the task whose worker received the trace:
                 # item -> exposure -> search.  exposure_item_id is the exposure
                 # identity because one parent exposure may deliver many items.
-                exposure_rows = list(
-                    db.execute(
-                        f"""SELECT item.exposure_item_id, item.trace_id,
+                exposure_statement = f"""SELECT item.exposure_item_id, item.trace_id,
                                    exposure.actor_id, search.task_id
                               FROM exposure_items AS item
                               JOIN exposures AS exposure
@@ -533,13 +748,18 @@ class SelectionStoreTraceSource:
                                 ON search.search_event_id = exposure.search_event_id
                              WHERE search.task_id IN ({placeholders})
                                AND item.trace_id <> ''
-                             ORDER BY search.task_id, item.exposure_item_id""",
-                        ordered,
-                    )
+                             ORDER BY search.task_id, item.exposure_item_id"""
+                exposure_rows, elapsed, fetched = self._read_query(
+                    db,
+                    query_name="exposure",
+                    query_index=2,
+                    statement=exposure_statement,
+                    parameters=ordered,
                 )
-                feedback_rows = list(
-                    db.execute(
-                        f"""SELECT feedback.feedback_event_id,
+                query_seconds += elapsed
+                fetch_seconds += fetched
+
+                feedback_statement = f"""SELECT feedback.feedback_event_id,
                                    feedback.exposure_item_id,
                                    feedback.trace_id,
                                    feedback.actor_id,
@@ -559,12 +779,22 @@ class SelectionStoreTraceSource:
                                AND feedback.trace_id = item.trace_id
                                AND feedback.feedback_kind IN ({','.join('?' for _ in _CANONICAL_FEEDBACK_KINDS)})
                                AND search.task_id IN ({placeholders})
-                             ORDER BY search.task_id, feedback.feedback_event_id""",
-                        tuple(sorted(_CANONICAL_FEEDBACK_KINDS)) + ordered,
-                    )
+                             ORDER BY search.task_id, feedback.feedback_event_id"""
+                feedback_rows, elapsed, fetched = self._read_query(
+                    db,
+                    query_name="feedback",
+                    query_index=3,
+                    statement=feedback_statement,
+                    parameters=tuple(sorted(_CANONICAL_FEEDBACK_KINDS)) + ordered,
                 )
+                query_seconds += elapsed
+                fetch_seconds += fetched
             finally:
                 db.execute("ROLLBACK")
+                if self._profiling_enabled:
+                    transaction_finished = time.monotonic()
+            if self._profiling_enabled:
+                read_scope_finished = time.monotonic()
 
         total = len(exposure_rows) + len(feedback_rows)
         if total > self.max_records:
@@ -573,6 +803,7 @@ class SelectionStoreTraceSource:
             # Polarity must come from the frozen selector contract.  Kind names
             # and arbitrary feedback payloads are not an acceptable substitute.
             raise ValueError("selection-store feedback projection requires feedback_values")
+        materialize_started = time.monotonic() if self._profiling_enabled else 0.0
         records: list[dict[str, Any]] = []
         sequence = 0
         for row in exposure_rows:
@@ -616,6 +847,46 @@ class SelectionStoreTraceSource:
         watermark = _canonical_sha(
             {"schema": "selection_store_v1_projection", "records": records}
         )
+        if self._profiling_enabled:
+            trace_ids = sorted(
+                {
+                    str(record.get("evidence_id") or record.get("trace_id") or "")
+                    for record in records
+                    if str(record.get("evidence_id") or record.get("trace_id") or "")
+                }
+            )
+            task_ids = sorted({str(record.get("task_id") or "") for record in records if record.get("task_id")})
+            self._profile_event(
+                "trace.bridge.sqlite",
+                db_operation="selection_store_projection",
+                input_rows=len(ordered),
+                output_rows=len(records),
+                rows_scanned=len(exposure_rows) + len(feedback_rows),
+                query_count=3,
+                query_seconds=query_seconds,
+                fetch_seconds=fetch_seconds,
+                read_mode="pinned_transaction",
+                # A deferred BEGIN does not acquire a read lock.  Report its
+                # bookkeeping separately instead of mislabelling it as lock
+                # contention; contention, if any, is paid by the first query.
+                begin_seconds=begin_seconds,
+                read_lock_wait_seconds=0.0,
+                read_transaction_seconds=max(
+                    0.0, transaction_finished - transaction_started
+                ),
+                read_scope_seconds=max(0.0, read_scope_finished - read_scope_started),
+                materialize_seconds=max(0.0, time.monotonic() - materialize_started),
+                task_set_count=len(task_ids),
+                task_set_sha256=_canonical_sha(task_ids),
+                trace_set_sha256=_canonical_sha(trace_ids),
+                # SelectionStore v1 has no append/cursor watermark.  Its
+                # content hash identifies the source snapshot only; leaving
+                # trace_watermark_sha256 absent avoids implying causal trace
+                # ordering that this schema cannot attest.
+                source_snapshot_sha256=_metadata_sha(
+                    watermark, namespace="source_snapshot"
+                ),
+            )
         return tuple(records), watermark
 
 
@@ -633,7 +904,7 @@ class SelectionRuntimeTraceSource:
     freshly materialized content hash; otherwise the adapter fails closed.
     """
 
-    def __init__(self, runtime: Any, *, max_records: int = 4096) -> None:
+    def __init__(self, runtime: Any, *, max_records: int = 4096, profiler: Any | None = None) -> None:
         selection_store = getattr(runtime, "selection_store", None)
         if selection_store is None:
             raise TypeError("selection runtime has no selection_store")
@@ -646,6 +917,7 @@ class SelectionRuntimeTraceSource:
             selection_store,
             feedback_values=values,
             max_records=max_records,
+            profiler=profiler if profiler is not None else getattr(runtime, "profiler", None),
         )
 
     def read_allocation_projection_snapshot(
@@ -939,9 +1211,21 @@ class TraceProjectionBridge:
         *,
         limits: TraceProjectionLimits | None = None,
         synthetic_features: Mapping[str, Mapping[str, Any]] | None = None,
+        profiler: Any | None = None,
     ) -> None:
         self.limits = limits or TraceProjectionLimits()
         self.adapter = TraceAllocationProjectionAdapter(self.limits)
+        self.profiler = profiler
+        try:
+            self._profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except BaseException:
+            self._profiling_enabled = False
+        self._profile_lock = threading.Lock()
+        self._profile_snapshot_seen: dict[str, int] = {}
+        self._profile_projection_calls = 0
+        self._profile_local = threading.local()
         self.synthetic_features = (
             {str(key): dict(value) for key, value in synthetic_features.items()}
             if synthetic_features is not None
@@ -950,16 +1234,241 @@ class TraceProjectionBridge:
 
     def zero(self, task_ids: Iterable[str], *, reason: str = "trace_store_unavailable") -> AllocationTraceView:
         ordered = _ordered_task_ids(task_ids, maximum=self.limits.max_tasks)
+        safe_reason = _safe_fallback_reason(reason)
         batch = build_synthetic_trace_projection(ordered)
+        self._profile_page(
+            source_kind="zero",
+            page_index=0,
+            records=0,
+            complete=True,
+            fallback_reason=safe_reason,
+        )
+        zero_watermark = "zero:" + _canonical_sha(
+            {"tasks": ordered, "reason": safe_reason}
+        )
         return AllocationTraceView(
             batch=batch,
-            watermark="zero:" + _canonical_sha({"tasks": ordered, "reason": reason}),
+            watermark=zero_watermark,
             source="zero",
             complete=True,
-            fallback_reason=str(reason)[:128],
+            fallback_reason=safe_reason,
+            trace_watermark_sha256=_metadata_sha(
+                zero_watermark, namespace="trace_watermark"
+            ),
         )
 
-    def read(
+    def _profile_page(self, *, source_kind: str, page_index: int, **fields: Any) -> None:
+        """Record one bounded source page and retain its count for the summary."""
+
+        if not self._profiling_enabled:
+            return
+        current = int(getattr(self._profile_local, "page_count", 0) or 0)
+        self._profile_local.page_count = max(current, int(page_index) + 1)
+        profile_fields = self._profile_call_fields()
+        profile_fields.update(fields)
+        self._profile_event(
+            "trace.bridge.page",
+            source_kind=source_kind,
+            page_index=page_index,
+            page_count=self._profile_local.page_count,
+            **profile_fields,
+        )
+
+    def _profile_call_fields(self) -> dict[str, int]:
+        """Return the call counter captured for the current profiled read."""
+
+        result: dict[str, int] = {}
+        for name in ("projection_call_index", "projection_calls"):
+            value = getattr(self._profile_local, name, None)
+            if value is not None:
+                result[name] = int(value)
+        return result
+
+    def _profile_snapshot_reuse(self, snapshot_hash: str) -> int:
+        """Return prior observations of a snapshot without introducing a cache."""
+
+        with self._profile_lock:
+            prior = self._profile_snapshot_seen.get(snapshot_hash, 0)
+            if (
+                prior == 0
+                and len(self._profile_snapshot_seen) >= _PROFILE_SNAPSHOT_HISTORY_LIMIT
+            ):
+                # This map is diagnostic history, not a projection cache.  A
+                # bounded FIFO eviction prevents a long run with many unique
+                # snapshots from becoming a second memory leak.
+                oldest = next(iter(self._profile_snapshot_seen), None)
+                if oldest is not None:
+                    self._profile_snapshot_seen.pop(oldest, None)
+            self._profile_snapshot_seen[snapshot_hash] = prior + 1
+        return prior
+
+    def _profile_projection_batch(
+        self,
+        batch: TraceAllocationProjectionBatch,
+        *,
+        source_kind: str,
+    ) -> TraceAllocationProjectionBatch:
+        """Measure adapter projection and bounded artifact materialization.
+
+        The adapter call is the business projection boundary.  Converting
+        projections to ``public_dict``/JSON is kept as a separate diagnostic
+        serialization phase so the profile does not confuse its own audit
+        work with the allocator's projection cost.
+        """
+
+        if not self._profiling_enabled:
+            return batch
+        status = "ok"
+        adapter_projection_seconds = float(
+            getattr(self._profile_local, "projection_seconds", 0.0) or 0.0
+        )
+        try:
+            # ``public_dict`` is an allow-listed, bounded representation.  It
+            # is used only for a digest/byte count and never returned to the
+            # caller from this bridge.
+            materialize_started = time.monotonic()
+            materialized_records = [
+                item.public_dict()
+                for item in (getattr(batch, "projections", ()) or ())
+            ]
+            materialized_records.sort(
+                key=lambda item: json.dumps(
+                    item,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            encoded = json.dumps(
+                materialized_records,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            serialization_seconds = max(0.0, time.monotonic() - materialize_started)
+            hash_started = time.monotonic()
+            projection_hash = _canonical_sha(
+                {"schema": "contextswarm_trace_projection_v1", "projections": materialized_records}
+            )
+            hash_seconds = max(0.0, time.monotonic() - hash_started)
+        except BaseException as exc:
+            # A profiling-only conversion must never make an otherwise valid
+            # projection fail.  Keep the terminal event useful, but omit the
+            # optional digest/byte measurements.
+            status = "error"
+            serialization_seconds = 0.0
+            hash_seconds = 0.0
+            projection_hash = ""
+            encoded = b""
+            profile_fields = self._profile_call_fields()
+            profile_fields.update(
+                {
+                    "source_kind": source_kind,
+                    "phase": "audit_serialization",
+                    "records": int(getattr(batch, "records_seen", 0) or 0),
+                    "output_rows": int(getattr(batch, "records_used", 0) or 0),
+                    "materialize_seconds": serialization_seconds,
+                    "serialization_seconds": serialization_seconds,
+                    "hash_seconds": hash_seconds,
+                    "projection_seconds": adapter_projection_seconds,
+                    "materialized_bytes": 0,
+                    "status": status,
+                    "error_kind": type(exc).__name__,
+                }
+            )
+            self._profile_event(
+                "trace.bridge.materialize",
+                **profile_fields,
+            )
+            self._profile_local.projection_hash = ""
+            self._profile_local.projection_serialization_seconds = 0.0
+            self._profile_local.projection_hash_seconds = 0.0
+            self._profile_local.projection_materialized_bytes = 0
+            return batch
+
+        self._profile_local.projection_hash = projection_hash
+        self._profile_local.projection_serialization_seconds = serialization_seconds
+        self._profile_local.projection_hash_seconds = hash_seconds
+        self._profile_local.projection_materialized_bytes = len(encoded)
+        profile_fields = self._profile_call_fields()
+        profile_fields.update(
+            {
+                "source_kind": source_kind,
+                "phase": "audit_serialization",
+                "records": int(getattr(batch, "records_seen", 0) or 0),
+                "output_rows": int(getattr(batch, "records_used", 0) or 0),
+                "materialize_seconds": serialization_seconds,
+                "projection_seconds": adapter_projection_seconds,
+                "serialization_seconds": serialization_seconds,
+                "hash_seconds": hash_seconds,
+                "materialized_bytes": len(encoded),
+                "projection_snapshot_sha256": projection_hash,
+                "status": status,
+            }
+        )
+        self._profile_event(
+            "trace.bridge.materialize",
+            **profile_fields,
+        )
+        return batch
+
+    def _project_records_observed(
+        self,
+        task_ids: Sequence[str],
+        records: Sequence[Any],
+        *,
+        ordinary_outcome_ids: Iterable[str],
+        source_watermark: int | str | None,
+        snapshot_id: str = "",
+        reference_time: float | None = None,
+        source_kind: str,
+    ) -> TraceAllocationProjectionBatch:
+        """Run the real adapter and time its business materialization."""
+
+        started = time.monotonic() if self._profiling_enabled else 0.0
+        with self._profile_span(
+            "trace.bridge.project",
+            operation="allocation_projection",
+            source_kind=source_kind,
+            **self._profile_call_fields(),
+        ):
+            batch = _project_complete_records(
+                self.adapter,
+                task_ids,
+                records,
+                ordinary_outcome_ids=ordinary_outcome_ids,
+                source_watermark=source_watermark,
+                snapshot_id=snapshot_id,
+                reference_time=reference_time,
+            )
+        if self._profiling_enabled:
+            self._profile_local.projection_seconds = max(
+                0.0, time.monotonic() - started
+            )
+            self._profile_projection_batch(batch, source_kind=source_kind)
+        return batch
+
+    def _profile_event(self, event: str, **fields: Any) -> None:
+        if not self._profiling_enabled:
+            return
+        try:
+            self.profiler.emit(event, **fields)
+        except BaseException:
+            return
+
+    def _profile_span(self, name: str, **fields: Any):
+        if not self._profiling_enabled:
+            return _NoopContext()
+        span = getattr(self.profiler, "span", None)
+        if callable(span):
+            try:
+                return _FailOpenContext(span(name, **fields))
+            except BaseException:
+                pass
+        return _NoopContext()
+
+    def _read_impl(
         self,
         task_ids: Iterable[str],
         *,
@@ -1000,11 +1509,22 @@ class TraceProjectionBridge:
         if self.synthetic_features is not None:
             selected = {task_id: self.synthetic_features.get(task_id, {}) for task_id in ordered}
             batch = build_synthetic_trace_projection(selected)
+            self._profile_projection_batch(batch, source_kind="synthetic")
+            self._profile_page(
+                source_kind="synthetic",
+                page_index=0,
+                records=0,
+                complete=True,
+            )
             return AllocationTraceView(
                 batch=batch,
                 watermark="synthetic:" + _canonical_sha(selected),
                 source="synthetic",
                 complete=True,
+                trace_watermark_sha256=_metadata_sha(
+                    "synthetic:" + _canonical_sha(selected),
+                    namespace="trace_watermark",
+                ),
             )
         if selection_runtime is not None:
             try:
@@ -1023,6 +1543,7 @@ class TraceProjectionBridge:
                 store = SelectionRuntimeTraceSource(
                     selection_runtime,
                     max_records=self.limits.max_records,
+                    profiler=self.profiler,
                 )
                 feedback_values = runtime_values
             except Exception as exc:
@@ -1039,11 +1560,13 @@ class TraceProjectionBridge:
                 page_reference_time: float | None = reference_time
                 source_watermark: int | str | None = None
                 seen_cursors: set[str] = set()
+                validator = _SnapshotRecordValidator()
                 # A page can contain at most max_records records.  One extra
                 # empty page is enough to detect a non-terminating source while
                 # keeping the bridge's work bounded.
                 max_pages = self.limits.max_records + 1
                 for _page_index in range(max_pages):
+                    page_started = time.monotonic() if self._profiling_enabled else 0.0
                     page = snapshot_protocol(
                         ordered,
                         as_of_watermark=as_of,
@@ -1052,6 +1575,17 @@ class TraceProjectionBridge:
                     )
                     if not isinstance(page, TraceProjectionSnapshotPage):
                         raise TypeError("snapshot source returned an invalid page")
+                    self._profile_page(
+                        source_kind="snapshot_protocol",
+                        page_index=_page_index,
+                        records=len(page.records),
+                        complete=page.complete,
+                        query_seconds=(
+                            max(0.0, time.monotonic() - page_started)
+                            if self._profiling_enabled
+                            else None
+                        ),
+                    )
                     if as_of is None:
                         as_of = page.trace_watermark
                     elif page.trace_watermark != as_of:
@@ -1074,20 +1608,19 @@ class TraceProjectionBridge:
                         ):
                             raise ValueError("source watermark changed during pagination")
                         source_watermark = page.source_watermark
-                    records.extend(page.records)
+                    new_records = validator.add(page.records)
+                    records.extend(new_records)
                     if len(records) > self.limits.max_records:
                         raise OverflowError("snapshot projection exceeds its record bound")
                     # A page may be replayed after a transient transport
-                    # retry.  Exact replay is deduplicated later, but a
-                    # same-ID row with changed topology would make the
-                    # materialized state depend on page order; reject it.
-                    _validate_snapshot_records(records)
+                    # retry.  Exact replay was removed from the bounded
+                    # materialization above, while a same-ID row with changed
+                    # topology still makes state depend on page order.
                     if page.complete:
                         if page.next_cursor:
                             raise ValueError("complete snapshot returned a cursor")
                         assert as_of is not None
-                        batch = _project_complete_records(
-                            self.adapter,
+                        batch = self._project_records_observed(
                             ordered,
                             records,
                             ordinary_outcome_ids=ordinary_ids,
@@ -1098,26 +1631,35 @@ class TraceProjectionBridge:
                             ),
                             snapshot_id=snapshot_id or as_of,
                             reference_time=page_reference_time,
+                            source_kind="snapshot_protocol",
                         )
                         if batch.truncated:
                             raise OverflowError("snapshot projection is incomplete")
+                        source_identity = (
+                            source_watermark
+                            if source_watermark is not None
+                            else (snapshot_id or as_of)
+                        )
+                        snapshot_watermark = "snapshot:" + _snapshot_identity(
+                            ordered,
+                            source_identity,
+                            records,
+                            ordinary_ids,
+                            snapshot_id=snapshot_id,
+                            reference_time=page_reference_time,
+                            trace_watermark=as_of,
+                        )
                         return AllocationTraceView(
                             batch=batch,
-                            watermark="snapshot:" + _snapshot_identity(
-                                ordered,
-                                (
-                                    source_watermark
-                                    if source_watermark is not None
-                                    else (snapshot_id or as_of)
-                                ),
-                                records,
-                                ordinary_ids,
-                                snapshot_id=snapshot_id,
-                                reference_time=page_reference_time,
-                                trace_watermark=as_of,
-                            ),
+                            watermark=snapshot_watermark,
                             source="selection_store_snapshot",
                             complete=True,
+                            trace_watermark_sha256=_metadata_sha(
+                                as_of, namespace="trace_watermark"
+                            ),
+                            source_snapshot_sha256=_metadata_sha(
+                                source_identity, namespace="source_snapshot"
+                            ),
                             trace_references=_trace_references(
                                 ordered, records, ordinary_ids
                             ),
@@ -1138,33 +1680,47 @@ class TraceProjectionBridge:
                 raw_batch = store.read_allocation_projection_records(
                     ordered, after_watermark=0, limit=self.limits.max_records
                 )
+                self._profile_page(
+                    source_kind="legacy_protocol",
+                    page_index=0,
+                    records=len(raw_batch.records),
+                    complete=raw_batch.complete,
+                )
                 if not _legacy_batch_is_complete(raw_batch):
                     raise ValueError("legacy projection source lacks a complete pinned snapshot")
                 _validate_snapshot_records(raw_batch.records)
-                batch = _project_complete_records(
-                    self.adapter,
+                batch = self._project_records_observed(
                     ordered,
                     raw_batch.records,
                     ordinary_outcome_ids=ordinary_ids,
                     source_watermark=raw_batch.watermark,
                     snapshot_id=getattr(raw_batch, "snapshot_id", ""),
                     reference_time=reference_time,
+                    source_kind="legacy_protocol",
                 )
                 if batch.truncated:
                     raise OverflowError("store-native projection is incomplete")
+                legacy_watermark = "legacy:" + _snapshot_identity(
+                    ordered,
+                    raw_batch.watermark,
+                    raw_batch.records,
+                    ordinary_ids,
+                    snapshot_id=getattr(raw_batch, "snapshot_id", ""),
+                    reference_time=reference_time,
+                    trace_watermark=str(raw_batch.watermark),
+                )
                 return AllocationTraceView(
                     batch=batch,
-                    watermark="legacy:" + _snapshot_identity(
-                        ordered,
-                        raw_batch.watermark,
-                        raw_batch.records,
-                        ordinary_ids,
-                        snapshot_id=getattr(raw_batch, "snapshot_id", ""),
-                        reference_time=reference_time,
-                        trace_watermark=str(raw_batch.watermark),
-                    ),
+                    watermark=legacy_watermark,
                     source="selection_store_protocol",
                     complete=True,
+                    trace_watermark_sha256=_metadata_sha(
+                        raw_batch.watermark, namespace="trace_watermark"
+                    ),
+                    source_snapshot_sha256=_metadata_sha(
+                        getattr(raw_batch, "snapshot_id", "") or raw_batch.watermark,
+                        namespace="source_snapshot",
+                    ),
                     trace_references=_trace_references(
                         ordered, raw_batch.records, ordinary_ids
                     ),
@@ -1176,28 +1732,197 @@ class TraceProjectionBridge:
                 store,
                 feedback_values=feedback_values,
                 max_records=self.limits.max_records,
+                profiler=self.profiler,
             )
             records, watermark = source.read_complete_records(ordered)
-            batch = _project_complete_records(
-                self.adapter,
+            self._profile_page(
+                source_kind="sqlite_v1",
+                page_index=0,
+                records=len(records),
+                complete=True,
+            )
+            batch = self._project_records_observed(
                 ordered,
                 records,
                 ordinary_outcome_ids=ordinary_ids,
                 source_watermark=len(records),
                 snapshot_id=watermark,
                 reference_time=reference_time,
+                source_kind="sqlite_v1",
             )
             if batch.truncated:
                 raise OverflowError("selection projection is incomplete")
+            sqlite_watermark = "sqlite-v1:" + watermark
             return AllocationTraceView(
                 batch=batch,
-                watermark="sqlite-v1:" + watermark,
+                watermark=sqlite_watermark,
                 source="selection_store_sqlite_v1",
                 complete=True,
+                # SQLite v1 has no causal append watermark.  The content hash
+                # is a source snapshot identity, not a trace watermark.
+                source_snapshot_sha256=_metadata_sha(
+                    watermark, namespace="source_snapshot"
+                ),
                 trace_references=_trace_references(ordered, records, ordinary_ids),
             )
         except Exception as exc:
             return self.zero(ordered, reason=_bounded_reason(exc))
+
+    def read(
+        self,
+        task_ids: Iterable[str],
+        *,
+        store: Any | None = None,
+        selection_runtime: Any | None = None,
+        feedback_values: Mapping[str, Any] | None = None,
+        ordinary_outcome_ids: Iterable[str] = (),
+        reference_time: float | None = None,
+    ) -> AllocationTraceView:
+        """Profile one complete projection read while preserving fail-closed behavior."""
+
+        if not self._profiling_enabled:
+            return self._read_impl(
+                task_ids,
+                store=store,
+                selection_runtime=selection_runtime,
+                feedback_values=feedback_values,
+                ordinary_outcome_ids=ordinary_outcome_ids,
+                reference_time=reference_time,
+            )
+        started = time.monotonic()
+        # Keep the disabled path streaming and untouched.  For an enabled
+        # profile, normalize the caller iterables once so the identity hash is
+        # stable and the bridge cannot accidentally consume a generator before
+        # the real projection reader sees it.
+        task_ids = tuple(task_ids)
+        ordinary_outcome_ids = tuple(ordinary_outcome_ids)
+        with self._profile_lock:
+            self._profile_projection_calls += 1
+            projection_call_index = self._profile_projection_calls
+            projection_calls = self._profile_projection_calls
+        self._profile_local.projection_call_index = projection_call_index
+        self._profile_local.projection_calls = projection_calls
+        self._profile_local.page_count = 0
+        for attribute in (
+            "projection_hash",
+            "projection_seconds",
+            "projection_serialization_seconds",
+            "projection_hash_seconds",
+            "projection_materialized_bytes",
+        ):
+            try:
+                delattr(self._profile_local, attribute)
+            except AttributeError:
+                pass
+        try:
+            with self._profile_span(
+                "trace.bridge.read",
+                operation="allocation_projection",
+                projection_call_index=projection_call_index,
+                projection_calls=projection_calls,
+            ):
+                view = self._read_impl(
+                    task_ids,
+                    store=store,
+                    selection_runtime=selection_runtime,
+                    feedback_values=feedback_values,
+                    ordinary_outcome_ids=ordinary_outcome_ids,
+                    reference_time=reference_time,
+                )
+            page_count = int(getattr(self._profile_local, "page_count", 0) or 0)
+            records_seen = int(getattr(view.batch, "records_seen", 0) or 0)
+            records_used = int(getattr(view.batch, "records_used", 0) or 0)
+            task_count = len(getattr(view.batch, "projections", ()) or ())
+            projection_snapshot_sha256 = str(
+                getattr(self._profile_local, "projection_hash", "") or ""
+            )
+            if not projection_snapshot_sha256:
+                projection_snapshot_sha256 = _metadata_sha(
+                    view.watermark, namespace="projection_snapshot"
+                )
+            trace_ids = sorted(
+                {
+                    trace_id
+                    for _task_id, references in view.trace_references
+                    for trace_id in references
+                    if trace_id
+                }
+            )
+            task_set = sorted({str(task_id) for task_id in task_ids if str(task_id)})
+            trace_set_sha256 = _canonical_sha(trace_ids)
+            # A non-empty trace set is the cross-module reuse identity.  For an
+            # empty set, retain task scope so unrelated zero/synthetic reads do
+            # not appear to reuse one another merely because both have no IDs.
+            reuse_identity = (
+                "trace-set:" + trace_set_sha256
+                if trace_ids
+                else "empty-trace-task-set:" + _canonical_sha(task_set)
+            )
+            reuse_count = self._profile_snapshot_reuse(reuse_identity)
+            materialized_bytes = int(
+                getattr(self._profile_local, "projection_materialized_bytes", 0) or 0
+            )
+            materialize_seconds = float(
+                getattr(self._profile_local, "projection_serialization_seconds", 0.0)
+                or 0.0
+            )
+            projection_seconds = float(
+                getattr(self._profile_local, "projection_seconds", 0.0) or 0.0
+            )
+            self._profile_event(
+                "trace.bridge.summary",
+                operation="allocation_projection",
+                source=view.source,
+                source_kind=view.source,
+                complete=view.complete,
+                records=records_seen,
+                task_count=task_count,
+                page_count=max(1, page_count),
+                output_rows=records_used,
+                materialized_rows=records_used,
+                materialized_bytes=materialized_bytes,
+                materialize_seconds=materialize_seconds,
+                projection_seconds=projection_seconds,
+                hash_seconds=float(
+                    getattr(self._profile_local, "projection_hash_seconds", 0.0)
+                    or 0.0
+                ),
+                projection_call_index=projection_call_index,
+                projection_calls=projection_calls,
+                projection_snapshot_sha256=projection_snapshot_sha256,
+                trace_watermark_sha256=(
+                    getattr(view, "trace_watermark_sha256", "") or None
+                ),
+                source_snapshot_sha256=(
+                    getattr(view, "source_snapshot_sha256", "") or None
+                ),
+                snapshot_hit=False,
+                reuse_count=reuse_count,
+                task_set_count=len(task_set),
+                task_set_sha256=_canonical_sha(task_set),
+                trace_set_sha256=trace_set_sha256,
+                wall_seconds=max(0.0, time.monotonic() - started),
+                fallback_reason=view.fallback_reason or None,
+            )
+            return view
+        finally:
+            try:
+                del self._profile_local.page_count
+            except AttributeError:
+                pass
+            for attribute in (
+                "projection_hash",
+                "projection_seconds",
+                "projection_serialization_seconds",
+                "projection_hash_seconds",
+                "projection_materialized_bytes",
+                "projection_call_index",
+                "projection_calls",
+            ):
+                try:
+                    delattr(self._profile_local, attribute)
+                except AttributeError:
+                    pass
 
 
 def feedback_values_from_config(config: Any) -> Mapping[str, Any] | None:

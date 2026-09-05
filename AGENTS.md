@@ -13,12 +13,16 @@
   separate “stable convergence” requirement. A failed individual attempt must
   not terminate the arm while time and slots remain: retain the best candidate
   and CPS state, record the failure, and refill the released slot.
-- Provider/coordinator/network instability is recoverable runtime noise. Retry
-  with backoff within the same horizon; when a session exhausts its retries,
-  resume or relaunch only the affected agent/slot from persisted state. Do not
-  restart, discard, or invalidate the whole arm solely because of transient
-  OAuth, coordinator, timeout, 429, 5xx, or connection errors. Retry time still
-  counts against the fixed horizon.
+- Provider/coordinator/network instability is recoverable runtime noise when it
+  is reported as an abnormal non-timeout result (including a transport/provider
+  diagnostic that happens to contain “timeout” while ``AgentResult.timed_out``
+  is false). Retry with backoff within the same horizon; when a session exhausts
+  its retries, resume or relaunch only the affected agent/slot from persisted
+  state. A task/Pi deadline timeout (``AgentResult.timed_out=True``) and a
+  runner-owned intentional cancellation are terminal for that logical actor:
+  do not same-session recover or same-actor refill them. CPS may release the
+  slot and admit a fresh assignment under the fixed scheduler contract. Retry
+  time still counts against the fixed horizon.
 - A job-bound terminal Judge result about the submitted candidate—including
   compile/verification failure, `RESOURCE_LIMIT`, and `EXECUTION_TIMEOUT`—is a
   candidate-attempt outcome by default. Record it as feedback/zero progress and

@@ -1,0 +1,42 @@
+extends = ["../paper_5min/_icpc_wf_2025.toml"]
+
+# Valid single-task control.  A one-slot arm cannot satisfy the twelve-task
+# closeout assignment contract within the same horizon, so this control keeps
+# one task end-to-end and is not mixed with the C24/C48/C96 twelve-task arms.
+[experiment]
+name = "capacity-paired-coding-cps1-single"
+output_root = "runs/paired_coding/cps1_single"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 1
+initial_agents_per_task = 1
+max_attempts_per_task = 0
+episodes_per_task = 1
+max_tasks = 1
+time_limit_seconds = 180
+seed = 0
+cancel_on_proved = true
+
+[aisw]
+enabled = true
+max_in_flight = 1
+
+[allocation]
+policy = "uniform"
+agent_timeout_seconds = 180
+
+[judge]
+max_concurrent_evaluations = 1
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+
+[pi]
+thinking = "max"
+timeout_seconds = 180
+http_idle_timeout_ms = 600000
+
+[selection]
+enabled = false
+
+[docker]
+memory_mb = 32768

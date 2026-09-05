@@ -1,0 +1,42 @@
+extends = ["../paper_5min/_icpc_wf_2025.toml"]
+
+# Matched profile-on/profile-off single-slot control.  The task set, model,
+# Judge contract, and horizon match the C24/C48/C96 capacity manifests; only
+# the active slot count is changed.
+[experiment]
+name = "capacity-paired-coding-cps1"
+output_root = "runs/paired_coding/cps1"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 1
+initial_agents_per_task = 1
+max_attempts_per_task = 0
+episodes_per_task = 1
+max_tasks = 12
+time_limit_seconds = 180
+seed = 0
+cancel_on_proved = true
+
+[aisw]
+enabled = true
+max_in_flight = 1
+
+[allocation]
+policy = "uniform"
+agent_timeout_seconds = 180
+
+[judge]
+max_concurrent_evaluations = 1
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+
+[pi]
+thinking = "max"
+timeout_seconds = 180
+http_idle_timeout_ms = 600000
+
+[selection]
+enabled = false
+
+[docker]
+memory_mb = 32768

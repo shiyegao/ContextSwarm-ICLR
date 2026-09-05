@@ -143,6 +143,7 @@ class RunnerSelectionIntegrationTests(unittest.TestCase):
             broker_result = runtime.broker_search(
                 SimpleNamespace(
                     actor_id="broker-worker",
+                    episode=4,
                     candidates={"task-a": object()},
                 ),
                 "result",
@@ -163,6 +164,8 @@ class RunnerSelectionIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(chain)
                 assert chain is not None
                 self.assertIsNotNone(chain["exposure"])
+                if request_key == broker_result["request_key"]:
+                    self.assertEqual(chain["search_event"]["query"]["episode"], 4)
                 self.assertEqual(
                     {item["trace_id"] for item in chain["items"]},
                     expected_trace_ids,
@@ -232,6 +235,7 @@ class RunnerSelectionIntegrationTests(unittest.TestCase):
             self.assertEqual(len(broker.calls), 1)
             self.assertEqual(_selection_capabilities(config), (True, False, False))
             self.assertFalse(broker.calls[0]["direct_messages_allowed"])
+            self.assertEqual(broker.calls[0]["episode"], 1)
             self.assertTrue(broker.calls[0]["selection_enabled"])
             self.assertIs(broker.calls[0]["selection_store"], selection_store)
             selection_search = broker.calls[0]["selection_search"]

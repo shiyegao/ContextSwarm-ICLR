@@ -1,0 +1,28 @@
+extends = ["cps48_selection.toml"]
+
+# One-run profiling diagnostic for the real coding-agent/Judge path.  This
+# inherits the C48 task set, model, 180-second horizon, Pi limits, NuRouter
+# capacity, and coding Judge contract unchanged.  It only switches the
+# allocator to the trace-aware policy on top of the already enabled selection
+# runtime so one admitted run can observe both selector persistence and trace
+# projection costs.
+#
+# Coverage caveat (kept explicit for the central runner): the current
+# trace_state allocator snapshot intentionally uses the policy's trace
+# projection and skips the legacy ``CPSStore.progress_snapshot`` call.  Thus
+# this manifest cannot by itself emit ``cps.progress.*`` until the runner adds
+# an observational progress probe (or the operator runs the dedicated CPS
+# baseline).  Do not infer that missing event means the CPS store was unused:
+# workers may still exercise CPS writes and selection-backed ``cps_search``.
+#
+# This is not a registered algorithm-comparison arm and must not be reported as
+# an algorithm result.  An operator must provide the real production NuRouter,
+# model, and coding Judge environment and explicitly enable profiling (for
+# example with CONTEXTSWARM_PROFILE=1); no endpoint or credential is stored in
+# this manifest.
+[experiment]
+name = "capacity-profile-coding-cps48-selection-trace"
+output_root = "runs/capacity_profile_coding/cps48_selection_trace"
+
+[allocation]
+policy = "trace_state"

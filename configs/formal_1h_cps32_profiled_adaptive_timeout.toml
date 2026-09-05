@@ -1,0 +1,11 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Treatment arm for the Agent-proposed Judge/evaluate validation-budget
+# experiment.  All task, model, horizon, CPS, evaluator, and runtime settings
+# inherit unchanged from the profiled clean reference; this switch only
+# advertises the optional timeout_seconds/--timeout capability.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-adaptive-timeout"
+
+[judge]
+agent_timeout_enabled = true

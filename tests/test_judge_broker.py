@@ -863,6 +863,64 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(audit["failure_attempts"], 6)
             self.assertEqual(audit["failure_retry_after_seconds"], 12.5)
 
+    def test_disabled_profiling_preserves_audit_timing_fields(self) -> None:
+        """The profiling-off path must retain the historical timing audit."""
+
+        class _DelayedEvaluator(_RecordingEvaluator):
+            def probe(
+                self,
+                task: Task,
+                candidate: Path,
+                *,
+                deadline_monotonic: float | None,
+            ) -> Verdict:
+                time.sleep(0.02)
+                return super().probe(
+                    task,
+                    candidate,
+                    deadline_monotonic=deadline_monotonic,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text(
+                "import Mathlib\ntheorem task : True := by trivial\n",
+                encoding="utf-8",
+            )
+            gate = threading.BoundedSemaphore(1)
+            # Hold the only evaluator slot long enough that the audit's
+            # gate_wait_seconds cannot be confused with the default zero.
+            gate.acquire()
+            release = threading.Timer(0.08, gate.release)
+            release.start()
+            audit_path = root / "judge_checks.jsonl"
+            broker = JudgeBroker(
+                _DelayedEvaluator(),
+                gate,
+                audit_path=audit_path,
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3.0,
+                ) as env:
+                    result = _post(env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {})
+            finally:
+                release.join(timeout=1.0)
+                broker.close()
+
+            audit = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+
+        self.assertEqual(result["status"], "VERIFY_FAIL")
+        self.assertGreater(audit["gate_wait_seconds"], 0.03)
+        self.assertGreater(audit["elapsed_seconds"], 0.03)
+
     def test_audit_preserves_nested_remote_cache_reuse_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

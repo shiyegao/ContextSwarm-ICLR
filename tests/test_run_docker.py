@@ -98,6 +98,15 @@ class RunDockerManifestTests(unittest.TestCase):
         env = os.environ.copy()
         env.pop("CONTEXTSWARM_MINI_IMAGE", None)
         env.pop("CONTEXTSWARM_MINI_MEMORY", None)
+        for profiling_env in (
+            "CONTEXTSWARM_PROFILE",
+            "CONTEXTSWARM_RESOURCE_PROFILING",
+            "CONTEXTSWARM_PROFILING",
+            "CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS",
+            "CONTEXTSWARM_PROFILE_INTERVAL_SECONDS",
+            "CONTEXTSWARM_PROFILE_PATH",
+        ):
+            env.pop(profiling_env, None)
         env.update(overrides)
         env.update(
             {
@@ -166,6 +175,36 @@ class RunDockerManifestTests(unittest.TestCase):
             self._captured_inspects()[0][-1],
             "registry.example:5000/paper/mini:operator",
         )
+
+    def test_opt_in_profiling_environment_is_forwarded_by_name_only(self) -> None:
+        private_profile_path = str(self.temp / "operator-private-profile.jsonl")
+        result = self._run(
+            CONTEXTSWARM_PROFILE="1",
+            CONTEXTSWARM_RESOURCE_PROFILING="1",
+            CONTEXTSWARM_PROFILING="1",
+            CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS="0.25",
+            CONTEXTSWARM_PROFILE_INTERVAL_SECONDS="2",
+            CONTEXTSWARM_PROFILE_PATH=private_profile_path,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self._captured_argv()
+        for variable in (
+            "CONTEXTSWARM_PROFILE",
+            "CONTEXTSWARM_RESOURCE_PROFILING",
+            "CONTEXTSWARM_PROFILING",
+            "CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS",
+            "CONTEXTSWARM_PROFILE_INTERVAL_SECONDS",
+            "CONTEXTSWARM_PROFILE_PATH",
+        ):
+            variable_index = argv.index(variable)
+            self.assertEqual(argv[variable_index - 1], "-e")
+            self.assertNotIn(f"{variable}=", argv)
+        self.assertNotIn("0.25", argv)
+        self.assertNotIn("2", argv)
+        self.assertNotIn(private_profile_path, argv)
+        self.assertNotIn(private_profile_path, result.stdout)
+        self.assertNotIn(private_profile_path, result.stderr)
 
     def test_pid_limit_has_cps48_headroom_and_remains_operator_overridable(self) -> None:
         result = self._run()

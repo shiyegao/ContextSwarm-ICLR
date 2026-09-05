@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import datetime as dt
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -13,13 +14,19 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .models import Task, Verdict
+from .timeout_policy import (
+    AGENT_TIMEOUT_MIN_SECONDS,
+    AgentTimeout,
+    agent_timeout_bounds,
+    normalize_agent_timeout,
+)
 
 
 LEAN_PROBE_RESPONSE_PROFILE = "lean_probe_v1"
@@ -33,6 +40,7 @@ _JUDGE_CANCEL_TIMEOUT_SECONDS = 2.0
 _CANCEL_AWARE_LONG_POLL_MS = 250
 _CANCEL_AWARE_HTTP_TIMEOUT_SECONDS = 1.0
 _MAX_SETTLEMENT_POLL_PATHS = 32
+_AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS = 0.01
 _MAX_WORKER_ERROR_BYTES = 1_200
 _MAX_WORKER_STATUS_BYTES = 120
 _MAX_WORKER_IDENTIFIER_BYTES = 256
@@ -75,6 +83,91 @@ _NON_CACHEABLE_PROBE_STATUSES = {
     "CANCELLED",
     "TASK_CANCELLED",
 }
+# Values copied into the optional profile stream are deliberately bounded.  A
+# Judge may expose implementation-specific status strings, but those strings
+# are not useful dimensions for a resource report and can have unbounded
+# cardinality.  Keep only the stable lifecycle labels and collapse the rest.
+_PROFILE_STATUS_VALUES = frozenset(
+    {
+        "ok",
+        "queued",
+        "running",
+        "accepted",
+        "submitted",
+        "cancel_requested",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "ac",
+        "wa",
+        "pe",
+        "ce",
+        "mle",
+        "tle",
+        "re",
+        "verify_fail",
+        "proved",
+        "local_rejected",
+        "evaluator_error",
+        "evaluator_timeout",
+        "network_error",
+        "out_of_horizon",
+        "timeout",
+        "overloaded",
+        "malformed",
+        "invalid_request",
+        "http_error",
+        "unsettled",
+        "other",
+    }
+)
+
+_PROFILE_STATUS_ALIASES = {
+    "complete": "succeeded",
+    "completed": "succeeded",
+    "pass": "proved",
+    "passed": "proved",
+    "cancelled_by_client": "cancelled",
+    "canceled": "cancelled",
+    "cancel_requested": "cancel_requested",
+    "request_cancelled": "cancelled",
+    "request_deadline_elapsed": "timeout",
+    "judge_overloaded": "overloaded",
+    "judge_overloaded_deadline": "overloaded",
+    "malformed_response": "malformed",
+    "invalid_request_configuration": "invalid_request",
+    "http_error": "http_error",
+    "remote_settlement_unconfirmed": "unsettled",
+    "cancel_settlement_unconfirmed": "unsettled",
+    "timeouterror": "timeout",
+    "timeout_error": "timeout",
+    "connectionerror": "network_error",
+    "urlerror": "network_error",
+    "httpexception": "network_error",
+    "oserror": "network_error",
+}
+
+
+def _profile_status(value: Any) -> str:
+    text = str(value or "").strip().casefold().replace("-", "_")
+    text = _PROFILE_STATUS_ALIASES.get(text, text)
+    return text if text in _PROFILE_STATUS_VALUES else "other"
+
+
+def _profile_clock() -> float:
+    """Read a diagnostic clock without allowing a broken clock to escape."""
+
+    try:
+        return time.monotonic()
+    except BaseException:
+        return 0.0
+
+
+def _profile_elapsed(started: float) -> float:
+    if not started:
+        return 0.0
+    return max(0.0, _profile_clock() - started)
 
 
 class EvaluatorError(RuntimeError):
@@ -436,7 +529,9 @@ class LeanEvaluator:
         cancel_grace_seconds: float = 5.0,
         admission_retry_seconds: float = 30.0,
         max_lifecycle_seconds: float | None = None,
+        backend_max_retries: int = 1,
         terminal_overload_retries: int = 1,
+        profiler: Any | None = None,
     ):
         self.base_url = normalize_base_url(base_url)
         self.lean_env_id = lean_env_id
@@ -455,6 +550,11 @@ class LeanEvaluator:
         if not math.isfinite(lifecycle_cap) or lifecycle_cap <= 0:
             raise ValueError("max_lifecycle_seconds must be finite and positive")
         self.max_lifecycle_seconds = lifecycle_cap
+        # This is the established Judge execution-retry policy.  It is kept
+        # independent from an Agent-proposed timeout: explicit budgets use the
+        # same number of logical retries, but divide one absolute budget over
+        # fresh attempts instead of multiplying a per-attempt timeout.
+        self.backend_max_retries = max(0, int(backend_max_retries))
         self.terminal_overload_retries = max(0, int(terminal_overload_retries))
         self._probe_cache: dict[str, Verdict] = {}
         self._probe_cache_lock = threading.Lock()
@@ -470,7 +570,173 @@ class LeanEvaluator:
         # fail-closed process latch above.
         self._deferred_settlement_lock = threading.RLock()
         self._deferred_settlements: dict[str, dict[str, Any]] = {}
+        # Per-thread dispatch state lets explicit-budget calls request a
+        # completed-result/singleflight cache bypass without changing the
+        # legacy arm or racing with another broker handler using this evaluator.
+        self._dispatch_context = threading.local()
+        self._settlement_poll_count = 0
+        self._settlement_poll_seconds = 0.0
+        self._settlement_receipt_count = 0
+        self._settlement_cancel_count = 0
         self.deferred_settlement_timeout_seconds = 300.0
+        # Profiling is an observational side channel.  Keep the sink optional
+        # and duck-typed so preflight/test adapters do not need to know about
+        # it, and make every call fail-open at this boundary.
+        self.profiler = profiler
+        try:
+            self._profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except BaseException:
+            self._profiling_enabled = False
+
+    def _normalize_agent_timeout(
+        self, timeout_seconds: int | None
+    ) -> AgentTimeout | None:
+        """Apply the evaluator-side hard ceiling to a worker suggestion."""
+
+        if timeout_seconds is None:
+            return None
+        return normalize_agent_timeout(
+            timeout_seconds,
+            configured_timeout_seconds=self.timeout_seconds,
+        )
+
+    @contextmanager
+    def _dispatch_cache_mode(self, mode: str):
+        """Set a request-local Judge dispatch/cache mode.
+
+        ``LeanEvaluator`` is shared by concurrent broker handlers.  A mutable
+        evaluator-wide flag would let one explicit retry accidentally disable
+        (or enable) cache for another request, so keep the state in a thread
+        local and restore it even when a transport call raises.
+        """
+
+        previous = getattr(self._dispatch_context, "cache_mode", None)
+        self._dispatch_context.cache_mode = str(mode)
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del self._dispatch_context.cache_mode
+                except AttributeError:
+                    pass
+            else:
+                self._dispatch_context.cache_mode = previous
+
+    def _profile_event(
+        self,
+        event: str,
+        *,
+        task: Task | None = None,
+        **fields: Any,
+    ) -> None:
+        if not self._profiling_enabled:
+            return
+        try:
+            self.profiler.emit(
+                event,
+                task_id=task.slug if task is not None else None,
+                **fields,
+            )
+        except BaseException:
+            # A diagnostic sink must never affect Judge lifecycle semantics.
+            return
+
+    @contextmanager
+    def _profile_span(self, name: str, *, task: Task | None = None, **fields: Any):
+        """Use an injected span without allowing it to mask evaluator errors."""
+
+        if not self._profiling_enabled:
+            yield
+            return
+        try:
+            context = self.profiler.span(
+                name,
+                task_id=task.slug if task is not None else None,
+                **fields,
+            )
+        except BaseException:
+            context = None
+        if context is None:
+            yield
+            return
+        try:
+            context.__enter__()
+        except BaseException:
+            yield
+            return
+        try:
+            yield
+        except BaseException:
+            try:
+                context.__exit__(*__import__("sys").exc_info())
+            except BaseException:
+                pass
+            raise
+        else:
+            try:
+                context.__exit__(None, None, None)
+            except BaseException:
+                pass
+
+    def _observed_request(
+        self,
+        operation: str,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        task: Task | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Call the concrete transport and emit one bounded stage timing row."""
+
+        if not self._profiling_enabled:
+            if payload is None:
+                return self._request(method, path, **kwargs)
+            return self._request(method, path, payload, **kwargs)
+        started = _profile_clock()
+        status = "ok"
+        attempts = 1
+        self._profile_event(
+            "judge.http.start",
+            task=task,
+            operation=operation,
+            phase=operation,
+            method=str(method).upper(),
+        )
+        try:
+            if payload is None:
+                response = self._request(method, path, **kwargs)
+            else:
+                response = self._request(method, path, payload, **kwargs)
+            if isinstance(response, Mapping):
+                raw_status = response.get("status") or response.get("job_status")
+                if isinstance(raw_status, str) and raw_status:
+                    # Keep only a low-cardinality lifecycle label; never copy a
+                    # response body or endpoint into the profile stream.
+                    status = _profile_status(raw_status)
+            return response
+        except EvaluatorError as exc:
+            status = _profile_status(exc.category or "error")
+            attempts = max(1, int(getattr(exc, "attempts", 1) or 1))
+            raise
+        except BaseException as exc:
+            status = _profile_status(type(exc).__name__)
+            raise
+        finally:
+            self._profile_event(
+                "judge.http.end",
+                task=task,
+                operation=operation,
+                phase=operation,
+                method=str(method).upper(),
+                status=status,
+                attempt_count=attempts,
+                elapsed_seconds=_profile_elapsed(started),
+            )
 
     @property
     def remote_unsettled_jobs(self) -> int:
@@ -496,6 +762,60 @@ class LeanEvaluator:
 
         with self._deferred_settlement_lock:
             return len(self._deferred_settlements)
+
+    def settlement_snapshot(self) -> dict[str, int | float]:
+        """Return bounded watcher counters for broker closeout profiling.
+
+        Job IDs, URLs, response bodies, and paths intentionally stay inside the
+        evaluator.  The broker only needs queue depth, age, and monotonic poll
+        counters to explain a long drain interval.
+        """
+
+        # This method is a diagnostics-only surface.  Keep the bounded counts
+        # available to callers even when profiling is disabled, but do not take
+        # an instrumentation clock (or derive watcher ages) on the hot/off
+        # path.
+        now = _profile_clock() if self._profiling_enabled else 0.0
+        with self._deferred_settlement_lock:
+            ages: list[float] = []
+            if self._profiling_enabled:
+                for record in self._deferred_settlements.values():
+                    try:
+                        started_at = float(record.get("started_at", now))
+                    except (TypeError, ValueError, OverflowError):
+                        started_at = now
+                    ages.append(max(0.0, now - started_at))
+            pending = len(ages)
+            if not self._profiling_enabled:
+                pending = len(self._deferred_settlements)
+            poll_count = self._settlement_poll_count
+            poll_seconds = self._settlement_poll_seconds
+            receipt_count = self._settlement_receipt_count
+            cancel_count = self._settlement_cancel_count
+        return {
+            "pending_settlement_watchers": pending,
+            "oldest_watcher_age_seconds": max(ages, default=0.0),
+            "poll_count": max(0, int(poll_count)),
+            "settlement_poll_seconds": max(0.0, float(poll_seconds)),
+            "settled_job_count": max(0, int(receipt_count)),
+            "cancel_job_count": max(0, int(cancel_count)),
+        }
+
+    def _profile_settlement_transition(
+        self,
+        state: str,
+        *,
+        elapsed_seconds: float | None = None,
+    ) -> None:
+        """Publish one value-free watcher transition and its aggregate state."""
+
+        if not self._profiling_enabled:
+            return
+        fields: dict[str, Any] = dict(self.settlement_snapshot())
+        fields["watcher_state"] = state
+        if elapsed_seconds is not None:
+            fields["elapsed_seconds"] = max(0.0, float(elapsed_seconds))
+        self._profile_event("judge.settlement.watcher", **fields)
 
     def _start_settlement_watcher(
         self,
@@ -537,9 +857,12 @@ class LeanEvaluator:
                 "cancel_endpoint": cancel_endpoint,
                 "paths": tuple(paths),
                 "callbacks": [callback] if callback is not None else [],
-                "started_at": time.monotonic(),
+                "started_at": _profile_clock() if self._profiling_enabled else 0.0,
             }
             self._deferred_settlements[normalized] = record
+            if self._profiling_enabled:
+                self._settlement_cancel_count += 1
+        self._profile_settlement_transition("started")
         thread = threading.Thread(
             target=self._settlement_watcher_loop,
             args=(record,),
@@ -551,6 +874,28 @@ class LeanEvaluator:
         return True
 
     def _settlement_watcher_loop(self, record: Mapping[str, Any]) -> None:
+        """Run a watcher with a terminal fail-closed boundary.
+
+        Polling is deliberately best-effort, but an unexpected adapter/sink
+        exception must not leave the watcher entry (and its evaluator permit)
+        permanently invisible to broker drain.  Convert such failures into the
+        same run-global unsettled latch used by a timeout.
+        """
+
+        try:
+            self._settlement_watcher_loop_impl(record)
+        except BaseException:
+            try:
+                job_id = str(record.get("job_id") or "")
+            except BaseException:
+                job_id = ""
+            self._mark_remote_unsettled()
+            if job_id:
+                with self._deferred_settlement_lock:
+                    self._deferred_settlements.pop(job_id, None)
+            self._profile_settlement_transition("error")
+
+    def _settlement_watcher_loop_impl(self, record: Mapping[str, Any]) -> None:
         job_id = str(record["job_id"])
         paths = list(record.get("paths") or ())
         path_index = 0
@@ -559,6 +904,7 @@ class LeanEvaluator:
         deadline = time.monotonic() + max(
             0.1, float(self.deferred_settlement_timeout_seconds)
         )
+        watcher_started = _profile_clock() if self._profiling_enabled else 0.0
         settled = False
         while paths and time.monotonic() < deadline:
             active_paths = [path for path in paths if path not in tainted_paths]
@@ -569,12 +915,24 @@ class LeanEvaluator:
             path = active_paths[path_index % len(active_paths)]
             separator = "&" if "?" in path else "?"
             try:
-                current = self._request(
-                    "GET",
-                    f"{path}{separator}wait_ms={wait_ms}",
-                    timeout_seconds=max(0.1, min(2.0, remaining)),
-                )
-            except EvaluatorError:
+                poll_started = _profile_clock() if self._profiling_enabled else 0.0
+                if self._profiling_enabled:
+                    with self._deferred_settlement_lock:
+                        self._settlement_poll_count += 1
+                try:
+                    current = self._observed_request(
+                        "settlement_poll",
+                        "GET",
+                        f"{path}{separator}wait_ms={wait_ms}",
+                        timeout_seconds=max(0.1, min(2.0, remaining)),
+                    )
+                finally:
+                    if self._profiling_enabled:
+                        with self._deferred_settlement_lock:
+                            self._settlement_poll_seconds += _profile_elapsed(
+                                poll_started
+                            )
+            except BaseException:
                 current = None
             if isinstance(current, Mapping):
                 identity = self._watcher_receipt_identity(current, job_id)
@@ -614,6 +972,9 @@ class LeanEvaluator:
                 if bound is not None and self._authoritative_terminal_receipt(
                     bound, job_id
                 ):
+                    if self._profiling_enabled:
+                        with self._deferred_settlement_lock:
+                            self._settlement_receipt_count += 1
                     settled = True
                     break
             path_index += 1
@@ -631,6 +992,10 @@ class LeanEvaluator:
             # unknown/transport-ambiguous submission.
             with self._deferred_settlement_lock:
                 current_record = self._deferred_settlements.pop(job_id, None)
+            self._profile_settlement_transition(
+                "timed_out",
+                elapsed_seconds=_profile_elapsed(watcher_started),
+            )
             return
 
         # Keep the record visible while callbacks run.  A broker closeout may
@@ -652,7 +1017,7 @@ class LeanEvaluator:
             for callback in callbacks:
                 try:
                     callback()
-                except Exception:
+                except BaseException:
                     # A permit-release callback is orchestration bookkeeping;
                     # if it fails, retain the fail-closed latch so a leaked
                     # permit cannot be mistaken for a drained run.
@@ -664,6 +1029,10 @@ class LeanEvaluator:
             current_record = self._deferred_settlements.get(job_id)
             if current_record is record:
                 self._deferred_settlements.pop(job_id, None)
+        self._profile_settlement_transition(
+            "settled" if not callback_failed else "callback_failed",
+            elapsed_seconds=_profile_elapsed(watcher_started),
+        )
 
     @staticmethod
     def _bind_watcher_receipt(
@@ -815,6 +1184,16 @@ class LeanEvaluator:
         headers = {"Accept": "application/json"}
         if request_payload is not None:
             headers["Content-Type"] = "application/json"
+        if (
+            is_job_submission
+            and getattr(self._dispatch_context, "cache_mode", None)
+            == _CACHE_MODE_DISABLED
+        ):
+            # Explicit cumulative-budget attempts are independent retries, not
+            # cache waiters.  The header is understood by the current Judge
+            # dispatch layer; older routers safely ignore it and still receive
+            # a distinct per-attempt timeout payload.
+            headers[_DISPATCH_CACHE_MODE_HEADER] = _CACHE_MODE_DISABLED
         token = str(__import__("os").environ.get("LEAN_AUTH_TOKEN") or "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -1057,6 +1436,9 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         """Evaluate a candidate, reusing an exact in-process probe when present."""
 
@@ -1066,6 +1448,9 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
             reuse_probe_cache=True,
         )
 
@@ -1077,6 +1462,9 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         """Evaluate through a fresh Judge submission, bypassing probe cache.
 
@@ -1091,6 +1479,9 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
             reuse_probe_cache=False,
         )
 
@@ -1103,6 +1494,9 @@ class LeanEvaluator:
         cancel_event: Any | None,
         reuse_probe_cache: bool,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         started = time.monotonic()
         code = _read_candidate(candidate_path)
@@ -1127,7 +1521,12 @@ class LeanEvaluator:
                 cancellation=None,
             )
         cache_key = self._probe_cache_key(task, code) if code is not None else None
-        if reuse_probe_cache and cache_key is not None:
+        # A caller-supplied timeout is part of the validation contract, not
+        # merely a presentation hint.  Do not return an older result which was
+        # produced under a different timeout (or under the legacy retry
+        # policy).  The Judge-side dispatch cache is bypassed separately by the
+        # request-local mode in ``_evaluate_with_total_budget``.
+        if timeout_seconds is None and reuse_probe_cache and cache_key is not None:
             cached = self._cached_verdict(cache_key)
             if cached is not None:
                 return cached
@@ -1141,6 +1540,9 @@ class LeanEvaluator:
             candidate_code=code,
             cancel_event=combined_cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
         verdict.cache_reused = bool(
             verdict.cache_reused
@@ -1156,6 +1558,9 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         """Run the canonical evaluator with bounded worker-facing diagnostics."""
 
@@ -1166,6 +1571,9 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
 
     def probe_source(
@@ -1176,6 +1584,9 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         """Probe a broker-owned immutable source snapshot."""
 
@@ -1188,6 +1599,9 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
 
     def _probe_source(
@@ -1199,6 +1613,9 @@ class LeanEvaluator:
         deadline_monotonic: float | None,
         cancel_event: threading.Event | None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         started = time.monotonic()
         if self.remote_unsettled_jobs > 0:
@@ -1209,7 +1626,11 @@ class LeanEvaluator:
             )
         combined_cancel_event = self._combined_cancel_event(cancel_event)
         cache_key = self._probe_cache_key(task, code) if code is not None else None
-        if not _cancel_requested(combined_cancel_event) and cache_key is not None:
+        if (
+            timeout_seconds is None
+            and not _cancel_requested(combined_cancel_event)
+            and cache_key is not None
+        ):
             cached = self._cached_verdict(cache_key)
             if cached is not None:
                 return cached
@@ -1223,12 +1644,19 @@ class LeanEvaluator:
             candidate_code=code,
             cancel_event=combined_cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
         verdict.cache_reused = bool(
             verdict.cache_reused
             or _nested_value(verdict.response, "cache_reused") is True
         )
-        if cache_key is not None and verdict.status not in _NON_CACHEABLE_PROBE_STATUSES:
+        if (
+            timeout_seconds is None
+            and cache_key is not None
+            and verdict.status not in _NON_CACHEABLE_PROBE_STATUSES
+        ):
             with self._probe_cache_lock:
                 self._probe_cache[cache_key] = copy.deepcopy(verdict)
         return verdict
@@ -1265,6 +1693,529 @@ class LeanEvaluator:
         candidate_code: str | None,
         cancel_event: threading.Event | None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
+    ) -> Verdict:
+        """Evaluate one logical request under the selected timeout contract.
+
+        The historical path (no ``timeout_seconds``) is intentionally kept in
+        :meth:`_evaluate_once`: its ``timeout`` and ``max_retries`` fields are
+        the legacy per-backend-attempt contract.  An explicit Agent value is a
+        different contract.  It is an absolute budget for this logical broker
+        call; retries are performed with fresh backend jobs and receive only
+        the remaining budget.  Keeping this dispatch at the evaluator layer
+        means the broker semaphore/handler remains owned by one call and no
+        allocator transition is needed.
+        """
+
+        if timeout_seconds is None:
+            return self._evaluate_once(
+                task,
+                candidate_path,
+                deadline_monotonic=deadline_monotonic,
+                started=started,
+                terminal_overload_retries=terminal_overload_retries,
+                response_profile=response_profile,
+                candidate_code=candidate_code,
+                cancel_event=cancel_event,
+                settlement_callback=settlement_callback,
+                timeout_seconds=None,
+            )
+        return self._evaluate_with_total_budget(
+            task,
+            candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            started=started,
+            terminal_overload_retries=terminal_overload_retries,
+            response_profile=response_profile,
+            candidate_code=candidate_code,
+            cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
+        )
+
+    def _evaluate_with_total_budget(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None,
+        started: float,
+        terminal_overload_retries: int,
+        response_profile: str | None,
+        candidate_code: str | None,
+        cancel_event: threading.Event | None,
+        settlement_callback: Any | None = None,
+        timeout_seconds: int,
+        timeout_deadline_monotonic: float | None = None,
+        attempt_runner: Callable[[float, int], Verdict] | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
+    ) -> Verdict:
+        """Run an explicit Agent budget across all safe evaluator retries.
+
+        The Judge API currently exposes a per-attempt ``timeout`` and a
+        per-job ``max_retries``.  Sending ``max_retries=0`` for each fresh
+        attempt and owning the retry loop here avoids multiplying a nominal
+        Agent budget (for example 60 s) into a 120 s backend tail.  The loop
+        still permits the configured number of retries for *abnormal,
+        candidate-independent* terminal failures.  A timeout, cancellation,
+        deterministic verification result, or an unsettled remote identity is
+        never retried.
+
+        ``deadline_monotonic`` remains the run horizon.  The earlier of the
+        horizon and the Agent budget is passed to the attempt evaluator so
+        admission, polling and cancellation observe one logical deadline.  A
+        short remote settlement grace may still be needed after that deadline;
+        the returned metadata distinguishes this bounded lifecycle grace from
+        actual validation budget consumption.
+        """
+
+        agent_timeout = self._normalize_agent_timeout(timeout_seconds)
+        if agent_timeout is None:  # defensive; the public dispatcher filters it
+            return self._evaluate_once(
+                task,
+                candidate_path,
+                deadline_monotonic=deadline_monotonic,
+                started=started,
+                terminal_overload_retries=terminal_overload_retries,
+                response_profile=response_profile,
+                candidate_code=candidate_code,
+                cancel_event=cancel_event,
+                settlement_callback=settlement_callback,
+                timeout_seconds=None,
+            )
+
+        budget_seconds = int(agent_timeout.effective_seconds)
+        budget_deadline = float(started) + float(budget_seconds)
+        if timeout_deadline_monotonic is not None:
+            try:
+                supplied_deadline = float(timeout_deadline_monotonic)
+            except (TypeError, ValueError, OverflowError):
+                supplied_deadline = budget_deadline
+            if math.isfinite(supplied_deadline):
+                budget_deadline = min(budget_deadline, supplied_deadline)
+        logical_deadline = budget_deadline
+        if deadline_monotonic is not None:
+            logical_deadline = min(logical_deadline, float(deadline_monotonic))
+
+        # Keep execution retry count independent from overload/admission retry
+        # count.  Both consume the same logical time budget, but a sustained
+        # overload should not silently consume a worker-failure retry slot (or
+        # vice versa).  ``backend_max_retries`` defaults to the historical one
+        # and is intentionally not coupled to the Agent's requested seconds.
+        execution_retries_left = max(0, int(self.backend_max_retries))
+        overload_retries_left = max(0, int(terminal_overload_retries))
+        attempt_index = 0
+        attempt_job_ids: list[str] = []
+        attempt_timeouts: list[int] = []
+        attempt_elapsed: list[float] = []
+        retry_reasons: list[str] = []
+        pending_retry_reason: str | None = None
+        last_verdict: Verdict | None = None
+
+        while True:
+            now = time.monotonic()
+            remaining = logical_deadline - now
+            # The default public Agent contract has a five-second floor.  A
+            # manifest may deliberately choose a smaller positive cap, in
+            # which case that cap is also the smallest executable attempt.
+            minimum_attempt_seconds = min(
+                AGENT_TIMEOUT_MIN_SECONDS, budget_seconds
+            )
+            if (
+                remaining
+                < minimum_attempt_seconds - _AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS
+            ):
+                if last_verdict is None:
+                    return self._total_budget_exhausted_verdict(
+                        task,
+                        started=started,
+                        candidate_code=candidate_code,
+                        budget_seconds=budget_seconds,
+                        budget_deadline=budget_deadline,
+                        logical_deadline=logical_deadline,
+                        attempt_index=attempt_index,
+                        attempt_job_ids=attempt_job_ids,
+                        attempt_timeouts=attempt_timeouts,
+                        attempt_elapsed=attempt_elapsed,
+                        retry_reasons=retry_reasons,
+                        timeout=agent_timeout,
+                        run_horizon=deadline_monotonic,
+                    )
+                return self._annotate_total_budget_verdict(
+                    last_verdict,
+                    budget_seconds=budget_seconds,
+                    budget_deadline=budget_deadline,
+                    logical_deadline=logical_deadline,
+                    attempt_index=attempt_index,
+                    attempt_job_ids=attempt_job_ids,
+                    attempt_timeouts=attempt_timeouts,
+                    attempt_elapsed=attempt_elapsed,
+                    retry_reasons=retry_reasons,
+                    exhausted=True,
+                    stop_reason=(
+                        "run_horizon"
+                        if deadline_monotonic is not None
+                        and time.monotonic() >= float(deadline_monotonic)
+                        else "budget_exhausted_before_retry"
+                    ),
+                    timeout=agent_timeout,
+                )
+
+            # A broker-owned formal quota may count each fresh backend job,
+            # not merely the logical helper call.  Reserve the next slot only
+            # after the remaining-budget check, so a retry that cannot honor
+            # the configured minimum floor does not consume quota speculatively.
+            if attempt_index > 0 and retry_admission_callback is not None:
+                try:
+                    retry_admitted = bool(retry_admission_callback())
+                except Exception:
+                    retry_admitted = False
+                if not retry_admitted:
+                    blocked_response = dict(last_verdict.response or {}) if last_verdict else {}
+                    blocked_response.update(
+                        {
+                            "formal_backend_budget_exhausted": True,
+                            "retry_blocked_reason": "formal_backend_job_quota",
+                        }
+                    )
+                    blocked_verdict = last_verdict or Verdict(
+                        task_id=task.slug,
+                        status="EVALUATOR_ERROR",
+                        score=0.0,
+                        elapsed_seconds=0.0,
+                        response=blocked_response,
+                        candidate_sha256=(
+                            candidate_sha256(candidate_code)
+                            if candidate_code is not None
+                            else None
+                        ),
+                        task_contract_sha256=self.expected_task_contract_sha256(task),
+                    )
+                    blocked_verdict = Verdict(
+                        task_id=blocked_verdict.task_id,
+                        status=blocked_verdict.status,
+                        score=blocked_verdict.score,
+                        elapsed_seconds=blocked_verdict.elapsed_seconds,
+                        response=blocked_response,
+                        error=blocked_verdict.error,
+                        candidate_sha256=blocked_verdict.candidate_sha256,
+                        task_contract_sha256=blocked_verdict.task_contract_sha256,
+                        judge_job_id=blocked_verdict.judge_job_id,
+                        cache_reused=blocked_verdict.cache_reused,
+                    )
+                    return self._annotate_total_budget_verdict(
+                        blocked_verdict,
+                        budget_seconds=budget_seconds,
+                        budget_deadline=budget_deadline,
+                        logical_deadline=logical_deadline,
+                        # ``attempt_index`` counts completed attempts.  The
+                        # callback is consulted before starting the next one,
+                        # so this remains the actual attempt count even when
+                        # quota denies the pending retry.
+                        attempt_index=attempt_index,
+                        attempt_job_ids=attempt_job_ids,
+                        attempt_timeouts=attempt_timeouts,
+                        attempt_elapsed=attempt_elapsed,
+                        # ``retry_reasons`` contains only retries that have
+                        # actually started.  The pending classified reason is
+                        # intentionally omitted because the quota denied the
+                        # next fresh attempt.
+                        retry_reasons=retry_reasons,
+                        exhausted=False,
+                        stop_reason="formal_backend_job_quota",
+                        timeout=agent_timeout,
+                    )
+
+            # The retry reason becomes observable only when the fresh attempt
+            # is actually admitted.  This keeps ``judge_retry_count`` from
+            # claiming a retry that was blocked by quota or fell below the
+            # configured minimum floor while waiting for the next loop turn.
+            if pending_retry_reason is not None:
+                retry_reasons.append(pending_retry_reason)
+                pending_retry_reason = None
+
+            # Round up the integer sent to Judge so normal sub-second adapter
+            # overhead does not turn a requested 60-second first attempt into
+            # 59 seconds.  The absolute monotonic deadline below remains the
+            # hard boundary, so the rounding cannot create another full
+            # timeout tail.
+            attempt_timeout = max(
+                minimum_attempt_seconds,
+                min(budget_seconds, int(math.ceil(remaining))),
+            )
+            attempt_index += 1
+            attempt_timeouts.append(attempt_timeout)
+            attempt_started = time.monotonic()
+            # A custom attempt must not receive the legacy in-job retry.  The
+            # fresh-attempt loop below is the single owner of retry accounting.
+            # Disable completed-result/singleflight cache for the whole custom
+            # call so an earlier timeout cannot be returned as a false retry.
+            with self._dispatch_cache_mode(_CACHE_MODE_DISABLED):
+                if attempt_runner is not None:
+                    verdict = attempt_runner(logical_deadline, attempt_timeout)
+                else:
+                    verdict = self._evaluate_once(
+                        task,
+                        candidate_path,
+                        deadline_monotonic=logical_deadline,
+                        started=started,
+                        terminal_overload_retries=0,
+                        response_profile=response_profile,
+                        candidate_code=candidate_code,
+                        cancel_event=cancel_event,
+                        settlement_callback=settlement_callback,
+                        timeout_seconds=attempt_timeout,
+                    )
+            verdict = _relabel_agent_budget_timeout(
+                verdict,
+                budget_deadline=budget_deadline,
+                run_horizon_deadline=deadline_monotonic,
+            )
+            attempt_elapsed.append(max(0.0, time.monotonic() - attempt_started))
+            last_verdict = verdict
+            if verdict.judge_job_id:
+                normalized_job_id = sanitize_worker_identifier(verdict.judge_job_id)
+                if normalized_job_id is not None:
+                    attempt_job_ids.append(normalized_job_id)
+
+            retry_class = _custom_retry_class(
+                verdict,
+                remaining_budget_seconds=max(
+                    0.0, min(budget_deadline, logical_deadline) - time.monotonic()
+                ),
+                budget_seconds=budget_seconds,
+                attempt_elapsed_seconds=attempt_elapsed[-1],
+            )
+            if retry_class is None:
+                now = time.monotonic()
+                if deadline_monotonic is not None and now >= float(deadline_monotonic):
+                    stop_reason = "run_horizon"
+                elif now >= budget_deadline:
+                    stop_reason = "budget_exhausted"
+                elif verdict.status in _CUSTOM_DETERMINISTIC_STATUSES:
+                    stop_reason = "terminal_verdict"
+                else:
+                    stop_reason = "not_retryable"
+                return self._annotate_total_budget_verdict(
+                    verdict,
+                    budget_seconds=budget_seconds,
+                    budget_deadline=budget_deadline,
+                    logical_deadline=logical_deadline,
+                    attempt_index=attempt_index,
+                    attempt_job_ids=attempt_job_ids,
+                    attempt_timeouts=attempt_timeouts,
+                    attempt_elapsed=attempt_elapsed,
+                    retry_reasons=retry_reasons,
+                    exhausted=(budget_deadline - now) <= 0,
+                    stop_reason=stop_reason,
+                    timeout=agent_timeout,
+                )
+            if retry_class == "overload":
+                if overload_retries_left <= 0:
+                    return self._annotate_total_budget_verdict(
+                        verdict,
+                        budget_seconds=budget_seconds,
+                        budget_deadline=budget_deadline,
+                        logical_deadline=logical_deadline,
+                        attempt_index=attempt_index,
+                        attempt_job_ids=attempt_job_ids,
+                        attempt_timeouts=attempt_timeouts,
+                        attempt_elapsed=attempt_elapsed,
+                        retry_reasons=retry_reasons,
+                        exhausted=False,
+                        stop_reason="retry_limit_overload",
+                        timeout=agent_timeout,
+                    )
+                overload_retries_left -= 1
+            else:
+                if execution_retries_left <= 0:
+                    return self._annotate_total_budget_verdict(
+                        verdict,
+                        budget_seconds=budget_seconds,
+                        budget_deadline=budget_deadline,
+                        logical_deadline=logical_deadline,
+                        attempt_index=attempt_index,
+                        attempt_job_ids=attempt_job_ids,
+                        attempt_timeouts=attempt_timeouts,
+                        attempt_elapsed=attempt_elapsed,
+                        retry_reasons=retry_reasons,
+                        exhausted=False,
+                        stop_reason="retry_limit_execution",
+                        timeout=agent_timeout,
+                    )
+                execution_retries_left -= 1
+            pending_retry_reason = retry_class
+
+            # A retry is useful only if the next backend attempt can honor the
+            # advertised floor.  The next loop computes the exact remaining
+            # integer and will return the last terminal result otherwise.
+
+    def _total_budget_exhausted_verdict(
+        self,
+        task: Task,
+        *,
+        started: float,
+        candidate_code: str | None,
+        budget_seconds: int,
+        budget_deadline: float,
+        logical_deadline: float,
+        attempt_index: int,
+        attempt_job_ids: list[str],
+        attempt_timeouts: list[int],
+        attempt_elapsed: list[float],
+        retry_reasons: list[str],
+        timeout: AgentTimeout,
+        run_horizon: float | None,
+    ) -> Verdict:
+        now = time.monotonic()
+        run_horizon_value: float | None = None
+        if run_horizon is not None:
+            try:
+                candidate_horizon = float(run_horizon)
+            except (TypeError, ValueError, OverflowError):
+                candidate_horizon = float("nan")
+            if math.isfinite(candidate_horizon):
+                run_horizon_value = candidate_horizon
+
+        # ``logical_deadline`` is the earlier of the Agent budget and the
+        # outer run horizon.  Reaching the configured minimum remaining-attempt
+        # floor before that logical deadline is not the same as exhausting the
+        # Agent budget:
+        # near the fixed run horizon there may still be 45/60 seconds in the
+        # Agent budget, but no safe time left to start another backend job.
+        # Classify that case as OUT_OF_HORIZON and keep the independent Agent
+        # budget remaining/exhausted fields truthful.
+        horizon_limited = (
+            run_horizon_value is not None
+            and run_horizon_value <= float(budget_deadline)
+            and float(logical_deadline) <= run_horizon_value
+        )
+        run_horizon_elapsed = (
+            run_horizon_value is not None and now >= run_horizon_value
+        )
+        budget_expired = now >= float(budget_deadline)
+        horizon_stop = horizon_limited or run_horizon_elapsed
+        status = "OUT_OF_HORIZON" if horizon_stop else "EVALUATOR_TIMEOUT"
+        verdict = Verdict(
+            task_id=task.slug,
+            status=status,
+            score=0.0,
+            elapsed_seconds=max(0.0, now - started),
+            response={
+                "reason": (
+                    "run_horizon_before_retry"
+                    if horizon_limited and not run_horizon_elapsed
+                    else "run_horizon_elapsed_before_retry"
+                    if run_horizon_elapsed
+                    else "agent_total_timeout_exhausted_before_retry"
+                ),
+            },
+            candidate_sha256=(
+                candidate_sha256(candidate_code)
+                if candidate_code is not None
+                else None
+            ),
+            task_contract_sha256=self.expected_task_contract_sha256(task),
+        )
+        return self._annotate_total_budget_verdict(
+            verdict,
+            budget_seconds=budget_seconds,
+            budget_deadline=budget_deadline,
+            logical_deadline=logical_deadline,
+            attempt_index=attempt_index,
+            attempt_job_ids=attempt_job_ids,
+            attempt_timeouts=attempt_timeouts,
+            attempt_elapsed=attempt_elapsed,
+            retry_reasons=retry_reasons,
+            exhausted=budget_expired,
+            stop_reason=("run_horizon" if horizon_stop else "budget_exhausted"),
+            timeout=timeout,
+        )
+
+    def _annotate_total_budget_verdict(
+        self,
+        verdict: Verdict,
+        *,
+        budget_seconds: int,
+        budget_deadline: float,
+        logical_deadline: float,
+        attempt_index: int,
+        attempt_job_ids: list[str],
+        attempt_timeouts: list[int],
+        attempt_elapsed: list[float],
+        retry_reasons: list[str],
+        exhausted: bool,
+        stop_reason: str | None = None,
+        timeout: AgentTimeout,
+    ) -> Verdict:
+        now = time.monotonic()
+        response = dict(verdict.response or {})
+        budget_started = float(budget_deadline) - float(budget_seconds)
+        budget_elapsed = max(0.0, now - budget_started)
+        budget_remaining = max(0.0, float(budget_deadline) - now)
+        retry_count = len(retry_reasons)
+        response.update(
+            {
+                "timeout_budget_mode": "cumulative_total",
+                "requested_timeout_seconds": int(timeout.requested_seconds),
+                "effective_timeout_seconds": int(timeout.effective_seconds),
+                "timeout_clamped": bool(timeout.clamped),
+                "timeout_source": "agent_requested",
+                "timeout_budget_seconds": int(budget_seconds),
+                "timeout_budget_elapsed_seconds": round(
+                    max(0.0, min(float(budget_seconds), budget_elapsed)),
+                    6,
+                ),
+                "timeout_budget_remaining_seconds": round(
+                    budget_remaining, 6
+                ),
+                "timeout_budget_exhausted": bool(exhausted),
+                "timeout_budget_stop_reason": (
+                    str(stop_reason)[:64] if stop_reason else None
+                ),
+                "judge_attempt_count": max(0, int(attempt_index)),
+                "judge_retry_count": max(0, int(retry_count)),
+                "judge_attempt_timeouts_seconds": [
+                    max(0, int(value)) for value in attempt_timeouts[:16]
+                ],
+                "judge_attempt_elapsed_seconds": [
+                    round(max(0.0, float(value)), 6)
+                    for value in attempt_elapsed[:16]
+                ],
+                "judge_retry_reasons": [str(value)[:64] for value in retry_reasons[:16]],
+                "judge_attempt_ids": list(attempt_job_ids[:16]),
+            }
+        )
+        return Verdict(
+            task_id=verdict.task_id,
+            status=verdict.status,
+            score=verdict.score,
+            elapsed_seconds=verdict.elapsed_seconds,
+            response=response,
+            error=verdict.error,
+            candidate_sha256=verdict.candidate_sha256,
+            task_contract_sha256=verdict.task_contract_sha256,
+            judge_job_id=verdict.judge_job_id,
+            cache_reused=verdict.cache_reused,
+        )
+
+    def _evaluate_once(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None,
+        started: float,
+        terminal_overload_retries: int,
+        response_profile: str | None,
+        candidate_code: str | None,
+        cancel_event: threading.Event | None,
+        settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         contract_sha256 = task_contract_sha256(
             task,
@@ -1344,17 +2295,42 @@ class LeanEvaluator:
                     {"reason": "run_horizon_elapsed_before_submission"},
                     **provenance,
                 )
-            execution_timeout = self.timeout_seconds
+            agent_timeout = self._normalize_agent_timeout(timeout_seconds)
+            execution_timeout = (
+                agent_timeout.effective_seconds
+                if agent_timeout is not None
+                else self.timeout_seconds
+            )
             if remaining_horizon is not None:
-                execution_timeout = min(execution_timeout, max(1, int(remaining_horizon)))
+                # Preserve the integer budget at the boundary.  The polling
+                # loop still enforces the absolute monotonic deadline; floor
+                # rounding here would unnecessarily turn (for example)
+                # 60.0 seconds into a 59-second Judge request before any work
+                # has actually consumed the budget.
+                horizon_seconds = (
+                    int(math.ceil(remaining_horizon))
+                    if agent_timeout is not None
+                    else int(remaining_horizon)
+                )
+                execution_timeout = min(
+                    execution_timeout,
+                    max(1, horizon_seconds),
+                )
+            # ``_evaluate_with_total_budget`` owns retries for explicit Agent
+            # budgets.  This method is also used by the legacy path, where the
+            # configured per-job retry policy remains intact.
+            backend_max_retries = (
+                0 if agent_timeout is not None else self.backend_max_retries
+            )
             payload = {
                 "code": code,
                 "target_code": target,
                 "timeout": execution_timeout,
-                # Preserve the established evaluator contract: one retry after
-                # a backend command timeout.  Admission/transport settlement
-                # remains a separate job-lifecycle concern.
-                "max_retries": 1,
+                # Explicit budgets are one backend attempt here; the outer
+                # logical-budget loop may issue a fresh attempt with the
+                # remaining budget.  The legacy path keeps its configured
+                # in-job retry count.
+                "max_retries": backend_max_retries,
                 "problem_id": task.problem_id,
                 "lean_env_id": self.lean_env_id,
                 "verification_profile": self.verification_profile,
@@ -1390,7 +2366,8 @@ class LeanEvaluator:
                         and time.monotonic() >= deadline_monotonic
                     )
                     rejection_response = _safe_response(
-                        last_admission_rejection or {}
+                        last_admission_rejection or {},
+                        timeout_max_seconds=self.timeout_seconds,
                     )
                     rejection_response.update(
                         {
@@ -1424,10 +2401,12 @@ class LeanEvaluator:
                 if cancel_event is not None:
                     request_options["cancel_event"] = cancel_event
                 try:
-                    submitted = self._request(
+                    submitted = self._observed_request(
+                        "submit",
                         "POST",
                         "/api/lean/jobs",
                         payload,
+                        task=task,
                         **request_options,
                     )
                     if not _confirmed_pre_admission_rejection(submitted):
@@ -1478,9 +2457,13 @@ class LeanEvaluator:
             if not job_id:
                 self._mark_remote_unsettled()
                 safe_response = (
-                    _safe_nonterminal_response(response)
+                    _safe_nonterminal_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    )
                     if not _terminal(response)
-                    else _safe_response(response)
+                    else _safe_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    )
                 )
                 safe_response.update(
                     {
@@ -1506,6 +2489,7 @@ class LeanEvaluator:
                 lifecycle_budget = _job_lifecycle_budget_seconds(
                     response,
                     execution_timeout=execution_timeout,
+                    backend_max_retries=backend_max_retries,
                     maximum_lifecycle_seconds=self.max_lifecycle_seconds,
                 )
                 settlement_deadline = (
@@ -1545,9 +2529,11 @@ class LeanEvaluator:
                     if cancel_event is not None:
                         request_options["cancel_event"] = cancel_event
                     try:
-                        response = self._request(
+                        response = self._observed_request(
+                            "poll",
                             "GET",
                             f"/api/lean/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}",
+                            task=task,
                             **request_options,
                         )
                     except EvaluatorError as exc:
@@ -1619,6 +2605,7 @@ class LeanEvaluator:
                         lifecycle_budget = _job_lifecycle_budget_seconds(
                             response,
                             execution_timeout=execution_timeout,
+                            backend_max_retries=backend_max_retries,
                             maximum_lifecycle_seconds=self.max_lifecycle_seconds,
                         )
                         settlement_deadline = max(
@@ -1681,7 +2668,9 @@ class LeanEvaluator:
                     )
                 if cancel_error:
                     last_poll_error = cancel_error
-                    safe_response = _safe_nonterminal_response(response)
+                    safe_response = _safe_nonterminal_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    )
                     safe_response.update(
                         {
                             "reason": "remote_settlement_unconfirmed",
@@ -1710,6 +2699,7 @@ class LeanEvaluator:
                     candidate_code=code,
                     cancel_event=cancel_event,
                     settlement_callback=settlement_callback,
+                    timeout_seconds=timeout_seconds,
                 )
                 if retried is not None:
                     return retried
@@ -1722,7 +2712,9 @@ class LeanEvaluator:
                         status="EVALUATOR_ERROR",
                         score=0.0,
                         elapsed_seconds=time.monotonic() - started,
-                        response=_safe_nonterminal_response(response),
+                        response=_safe_nonterminal_response(
+                            response, timeout_max_seconds=self.timeout_seconds
+                        ),
                         error=outcome_error,
                         judge_job_id=normalized_job_id,
                         **provenance,
@@ -1736,11 +2728,15 @@ class LeanEvaluator:
                         status="PROVED" if proved else abandoned_status,
                         score=1.0 if proved else 0.0,
                         elapsed_seconds=time.monotonic() - started,
-                        response=_safe_response(response),
+                        response=_safe_response(
+                            response, timeout_max_seconds=self.timeout_seconds
+                        ),
                         judge_job_id=normalized_job_id,
                         **provenance,
                     )
-                safe_response = _safe_response(response)
+                safe_response = _safe_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
                 safe_response["reason"] = (
                     "run_horizon_elapsed_during_evaluation"
                     if deadline_monotonic is not None
@@ -1766,7 +2762,9 @@ class LeanEvaluator:
                 )
             if not _terminal(response):
                 horizon_elapsed = deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
-                safe_response = _safe_nonterminal_response(response)
+                safe_response = _safe_nonterminal_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
                 safe_response["reason"] = (
                     "run_horizon_elapsed_during_evaluation"
                     if horizon_elapsed
@@ -1791,7 +2789,9 @@ class LeanEvaluator:
                     status="EVALUATOR_ERROR",
                     score=0.0,
                     elapsed_seconds=time.monotonic() - started,
-                    response=_safe_nonterminal_response(response),
+                    response=_safe_nonterminal_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    ),
                     error=outcome_error,
                     judge_job_id=normalized_job_id,
                     **provenance,
@@ -1801,7 +2801,9 @@ class LeanEvaluator:
                 status="PROVED" if proved else status,
                 score=1.0 if proved else 0.0,
                 elapsed_seconds=time.monotonic() - started,
-                response=_safe_response(response),
+                response=_safe_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                ),
                 judge_job_id=normalized_job_id,
                 **provenance,
             )
@@ -1876,6 +2878,7 @@ class LeanEvaluator:
                         ),
                         cancel_event=cancel_event,
                         settlement_callback=settlement_callback,
+                        timeout_seconds=timeout_seconds,
                     )
                     if retried is not None:
                         return retried
@@ -1890,7 +2893,9 @@ class LeanEvaluator:
                         status="PROVED" if proved else reconciled_status,
                         score=1.0 if proved else 0.0,
                         elapsed_seconds=time.monotonic() - started,
-                        response=_safe_response(response),
+                        response=_safe_response(
+                            response, timeout_max_seconds=self.timeout_seconds
+                        ),
                         judge_job_id=sanitize_worker_identifier(job_id),
                         **provenance,
                     )
@@ -1902,10 +2907,14 @@ class LeanEvaluator:
             ):
                 response = dict(exc.submission_response)
             safe_error_response = (
-                _safe_nonterminal_response(response)
+                _safe_nonterminal_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
                 if _verdict_status(response) in _NONTERMINAL_STATUSES
                 or not _terminal(response)
-                else _safe_response(response)
+                else _safe_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
             )
             if isinstance(exc, EvaluatorError):
                 safe_error_response["evaluator_failure"] = exc.public_details()
@@ -1964,6 +2973,7 @@ class LeanEvaluator:
         candidate_code: str | None,
         cancel_event: threading.Event | None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict | None:
         """Resubmit once a previous job is definitively terminal and retryable."""
 
@@ -1984,6 +2994,7 @@ class LeanEvaluator:
             candidate_code=candidate_code,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
         prior = verdict.response.get("evaluator_overload_resubmissions", 0)
         verdict.response["evaluator_overload_resubmissions"] = (
@@ -2041,7 +3052,8 @@ class LeanEvaluator:
             attempted = remaining > 0
             try:
                 if attempted:
-                    current = self._request(
+                    current = self._observed_request(
+                        "cancel",
                         "DELETE",
                         cancel_path,
                         timeout_seconds=min(
@@ -2076,7 +3088,8 @@ class LeanEvaluator:
             poll_path = poll_paths[poll_index % len(poll_paths)]
             separator = "&" if "?" in poll_path else "?"
             try:
-                current = self._request(
+                current = self._observed_request(
+                    "reconcile_poll",
                     "GET",
                     f"{poll_path}{separator}wait_ms={wait_ms}",
                     timeout_seconds=remaining,
@@ -2344,7 +3357,9 @@ class CodingEvaluator(LeanEvaluator):
         judge_mode: str = "coding",
         poll_interval_seconds: float = 0.25,
         cancel_grace_seconds: float = 5.0,
+        backend_max_retries: int = 1,
         require_result_cache_disabled: bool = False,
+        profiler: Any | None = None,
     ):
         super().__init__(
             normalize_base_url(base_url),
@@ -2358,7 +3373,9 @@ class CodingEvaluator(LeanEvaluator):
             # Coding admission has no Lean overload replay path.  The runner
             # handles retry/refill at the candidate-attempt level.
             admission_retry_seconds=min(30.0, max(0.1, float(cancel_grace_seconds))),
+            backend_max_retries=backend_max_retries,
             terminal_overload_retries=0,
+            profiler=profiler,
         )
         # Keep this policy on the adapter rather than putting it in candidate
         # JSON.  The Judge's dispatch contract treats cache mode as an
@@ -2426,13 +3443,42 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
-        return self._evaluate_code(
+        started = time.monotonic()
+        source = _read_candidate(candidate_path)
+        if timeout_seconds is None:
+            return self._evaluate_code(
+                task,
+                source,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+                settlement_callback=settlement_callback,
+                timeout_seconds=None,
+            )
+        return self._evaluate_with_total_budget(
             task,
-            _read_candidate(candidate_path),
+            candidate_path,
             deadline_monotonic=deadline_monotonic,
+            started=started,
+            terminal_overload_retries=0,
+            response_profile=None,
+            candidate_code=source,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
+            attempt_runner=lambda attempt_deadline, attempt_timeout: self._evaluate_code(
+                task,
+                source,
+                deadline_monotonic=attempt_deadline,
+                cancel_event=cancel_event,
+                settlement_callback=settlement_callback,
+                timeout_seconds=attempt_timeout,
+            ),
         )
 
     def evaluate_fresh(
@@ -2443,6 +3489,9 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         return self.evaluate(
             task,
@@ -2450,6 +3499,9 @@ class CodingEvaluator(LeanEvaluator):
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
 
     def probe(
@@ -2460,6 +3512,9 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         return self.evaluate(
             task,
@@ -2467,6 +3522,9 @@ class CodingEvaluator(LeanEvaluator):
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
 
     def probe_source(
@@ -2477,15 +3535,43 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         if not isinstance(candidate_code, str):
             raise TypeError("candidate_code must be a string")
-        return self._evaluate_code(
+        if timeout_seconds is None:
+            return self._evaluate_code(
+                task,
+                candidate_code,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+                settlement_callback=settlement_callback,
+                timeout_seconds=None,
+            )
+        started = time.monotonic()
+        return self._evaluate_with_total_budget(
             task,
-            candidate_code,
+            Path("<broker-candidate-snapshot>"),
             deadline_monotonic=deadline_monotonic,
+            started=started,
+            terminal_overload_retries=0,
+            response_profile=None,
+            candidate_code=candidate_code,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
+            attempt_runner=lambda attempt_deadline, attempt_timeout: self._evaluate_code(
+                task,
+                candidate_code,
+                deadline_monotonic=attempt_deadline,
+                cancel_event=cancel_event,
+                settlement_callback=settlement_callback,
+                timeout_seconds=attempt_timeout,
+            ),
         )
 
     def _request(
@@ -2506,7 +3592,11 @@ class CodingEvaluator(LeanEvaluator):
         if data is not None:
             headers["Content-Type"] = "application/json"
         if (
-            self.require_result_cache_disabled
+            (
+                self.require_result_cache_disabled
+                or getattr(self._dispatch_context, "cache_mode", None)
+                == _CACHE_MODE_DISABLED
+            )
             and method.upper() == "POST"
             and path == "/api/judge/jobs"
         ):
@@ -2569,6 +3659,7 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None,
         cancel_event: Any | None,
         settlement_callback: Any | None,
+        timeout_seconds: int | None,
     ) -> Verdict:
         started = time.monotonic()
         source = code or ""
@@ -2584,7 +3675,14 @@ class CodingEvaluator(LeanEvaluator):
             return Verdict(task.slug, "TASK_CANCELLED", 0.0, 0.0, {"reason": "cancel_event_set"}, **provenance)
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"}, **provenance)
+        agent_timeout = self._normalize_agent_timeout(timeout_seconds)
+        execution_timeout = (
+            agent_timeout.effective_seconds
+            if agent_timeout is not None
+            else self.timeout_seconds
+        )
         job_id: str | None = None
+        cancel_endpoint: Any = None
         response: dict[str, Any] = {}
 
         def reconcile_cancel(reason: str) -> tuple[dict[str, Any], str | None, bool]:
@@ -2604,15 +3702,39 @@ class CodingEvaluator(LeanEvaluator):
             return current, error, attempted
 
         try:
-            submitted = self._request(
+            submission_payload: dict[str, Any] = {
+                "problem_id": task.problem_id,
+                "language": task.language,
+                "code": source,
+                "submission_id": f"contextswarm-{uuid.uuid4().hex}",
+            }
+            if agent_timeout is not None:
+                remaining_budget = (
+                    deadline_monotonic - time.monotonic()
+                    if deadline_monotonic is not None
+                    else None
+                )
+                if remaining_budget is not None:
+                    if remaining_budget < 1.0:
+                        return Verdict(
+                            task.slug,
+                            "OUT_OF_HORIZON",
+                            0.0,
+                            time.monotonic() - started,
+                            {"reason": "agent_total_timeout_elapsed_before_submission"},
+                            **provenance,
+                        )
+                    execution_timeout = min(
+                        execution_timeout,
+                        max(1, int(math.ceil(remaining_budget))),
+                    )
+                submission_payload["timeout"] = execution_timeout
+            submitted = self._observed_request(
+                "submit",
                 "POST",
                 "/api/judge/jobs",
-                {
-                    "problem_id": task.problem_id,
-                    "language": task.language,
-                    "code": source,
-                    "submission_id": f"contextswarm-{uuid.uuid4().hex}",
-                },
+                submission_payload,
+                task=task,
                 timeout_seconds=min(30.0, max(1.0, (deadline_monotonic - time.monotonic()) if deadline_monotonic else 30.0)),
             )
             raw_job_id = submitted.get("job_id") or submitted.get("id")
@@ -2695,12 +3817,21 @@ class CodingEvaluator(LeanEvaluator):
                         )
                     break
                 wait_ms = min(1000, max(1, int(min(remaining, 1.0) * 1000)))
-                response = self._request("GET", f"/api/judge/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}", timeout_seconds=max(1.0, min(30.0, remaining)))
+                response = self._observed_request(
+                    "poll",
+                    "GET",
+                    f"/api/judge/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}",
+                    task=task,
+                    timeout_seconds=max(1.0, min(30.0, remaining)),
+                )
                 if response.get("cancel_endpoint") or response.get("status_endpoint"):
                     cancel_endpoint = response.get("cancel_endpoint") or response.get("status_endpoint")
             status = self._response_status(response)
             nested = response.get("response") if isinstance(response.get("response"), Mapping) else {}
-            safe = safe_worker_response(nested if nested else response)
+            safe = safe_worker_response(
+                nested if nested else response,
+                timeout_max_seconds=self.timeout_seconds,
+            )
             safe["job_status"] = str(response.get("status") or response.get("job_status") or "")[:64]
             safe["judge_job_id"] = job_id
             # Preserve Judge-side cache provenance in the worker-safe receipt.
@@ -2747,8 +3878,16 @@ class MockEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del (
+            deadline_monotonic,
+            timeout_seconds,
+            timeout_deadline_monotonic,
+            retry_admission_callback,
+        )
         if _cancel_requested(cancel_event):
             return Verdict(
                 task.slug,
@@ -2786,6 +3925,9 @@ class MockEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
         if _cancel_requested(cancel_event):
             return Verdict(
@@ -2800,6 +3942,9 @@ class MockEvaluator:
             candidate_path,
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
+            retry_admission_callback=retry_admission_callback,
         )
 
     def probe_source(
@@ -2809,8 +3954,16 @@ class MockEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        timeout_seconds: int | None = None,
+        timeout_deadline_monotonic: float | None = None,
+        retry_admission_callback: Callable[[], bool] | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del (
+            deadline_monotonic,
+            timeout_seconds,
+            timeout_deadline_monotonic,
+            retry_admission_callback,
+        )
         provenance = {
             "candidate_sha256": candidate_sha256(candidate_code),
             "task_contract_sha256": self.expected_task_contract_sha256(task),
@@ -2966,6 +4119,7 @@ def _job_lifecycle_budget_seconds(
     payload: Mapping[str, Any],
     *,
     execution_timeout: int,
+    backend_max_retries: int = 1,
     maximum_lifecycle_seconds: float,
 ) -> float:
     """Return a conservative whole-job budget from the Judge receipt.
@@ -3019,10 +4173,14 @@ def _job_lifecycle_budget_seconds(
     # and SafeVerify finalization may each consume another queue/command budget.
     # This intentionally over-bounds fast/official profiles rather than
     # cancelling a valid proof before the server's own lifecycle can settle.
-    # max_retries=1 permits two main verification attempts; a cold cached REPL
-    # can spend one additional command on its header, then formal signature and
-    # SafeVerify finalization can each spend one command.
-    return checked((3.0 * queue_budget) + (5.0 * timeout) + 20.0)
+    # One main command plus header/signature/SafeVerify accounts for four
+    # execution budgets.  Each retry configured on the *legacy single-job*
+    # path adds one more.  Explicit Agent budgets use the outer logical loop,
+    # where each fresh job has max_retries=0 and the absolute remaining budget
+    # is enforced separately; this fallback is therefore only used for one
+    # attempt at a time.
+    retries = max(0, int(backend_max_retries))
+    return checked((3.0 * queue_budget) + ((4 + retries) * timeout) + 20.0)
 
 
 def _verdict_status(payload: Mapping[str, Any]) -> str:
@@ -3081,6 +4239,200 @@ def _settled_outcome(
             "Judge lifecycle failure contradicts a proof verdict",
         )
     return status, False, None
+
+
+_CUSTOM_DETERMINISTIC_STATUSES = frozenset(
+    {
+        "PROVED",
+        "AC",
+        "PASS",
+        "PASSED",
+        "VERIFY_FAIL",
+        "COMPILES_WITH_SORRY",
+        "CHEATING",
+        "LOCAL_REJECTED",
+        "INVALID_REQUEST",
+        "INVALID_TASK_SELECTION",
+        "BUDGET_EXHAUSTED",
+        "RESOURCE_LIMIT",
+        "WA",
+        "PE",
+        "CE",
+        "MLE",
+        "TLE",
+        "RE",
+        "ELABORATED",
+        "ELAB_FAILED",
+        "MOCK_SKIPPED",
+        "CANCELLED",
+        "TASK_CANCELLED",
+        "OUT_OF_HORIZON",
+        "REMOTE_SETTLEMENT_UNCONFIRMED",
+        "EXECUTION_TIMEOUT",
+        "EVALUATOR_TIMEOUT",
+    }
+)
+
+_CUSTOM_TRANSIENT_ERROR_KINDS = frozenset(
+    {
+        "workspace_not_ready",
+        "runtime_exception",
+        "protocol_error",
+        "service_unavailable",
+        "connection_reset",
+        "connection_refused",
+        "network_error",
+    }
+)
+
+
+def _relabel_agent_budget_timeout(
+    verdict: Verdict,
+    *,
+    budget_deadline: float,
+    run_horizon_deadline: float | None,
+) -> Verdict:
+    """Enforce the absolute Agent budget at the evaluator boundary.
+
+    ``_evaluate_once`` receives the earlier of the run horizon and the Agent
+    deadline so that polling/cancellation share one absolute boundary.  Its
+    historical status for that boundary is ``OUT_OF_HORIZON``.  A terminal
+    receipt can nevertheless arrive during the bounded settlement grace.  It
+    must not become a successful (or otherwise ordinary) result after the
+    Agent's deadline, so convert late non-safety outcomes to
+    ``EVALUATOR_TIMEOUT``.  A real run-horizon expiry remains
+    ``OUT_OF_HORIZON``; unresolved/cancellation states remain fail-closed.
+    """
+
+    now = time.monotonic()
+    if now < float(budget_deadline):
+        return verdict
+    if run_horizon_deadline is not None and now >= float(run_horizon_deadline):
+        return verdict
+    status = str(verdict.status or "").strip().upper()
+    if status in {
+        "REMOTE_SETTLEMENT_UNCONFIRMED",
+        "TASK_CANCELLED",
+        "CANCELLED",
+        "EVALUATOR_TIMEOUT",
+        "EXECUTION_TIMEOUT",
+    }:
+        response = dict(verdict.response or {})
+        response["timeout_budget_exhausted"] = True
+        response["timeout_budget_remaining_seconds"] = 0.0
+        return Verdict(
+            task_id=verdict.task_id,
+            status=verdict.status,
+            score=verdict.score,
+            elapsed_seconds=verdict.elapsed_seconds,
+            response=response,
+            error=verdict.error,
+            candidate_sha256=verdict.candidate_sha256,
+            task_contract_sha256=verdict.task_contract_sha256,
+            judge_job_id=verdict.judge_job_id,
+            cache_reused=verdict.cache_reused,
+        )
+    response = dict(verdict.response or {})
+    response.setdefault("reason", "agent_total_timeout_exhausted")
+    response["timeout_budget_exhausted"] = True
+    response["timeout_budget_remaining_seconds"] = 0.0
+    return Verdict(
+        task_id=verdict.task_id,
+        status="EVALUATOR_TIMEOUT",
+        score=0.0,
+        elapsed_seconds=verdict.elapsed_seconds,
+        response=response,
+        error=verdict.error or "Agent validation budget elapsed",
+        candidate_sha256=verdict.candidate_sha256,
+        task_contract_sha256=verdict.task_contract_sha256,
+        judge_job_id=verdict.judge_job_id,
+        cache_reused=verdict.cache_reused,
+    )
+
+
+def _custom_retry_class(
+    verdict: Verdict,
+    *,
+    remaining_budget_seconds: float,
+    budget_seconds: int,
+    attempt_elapsed_seconds: float,
+) -> str | None:
+    """Classify one explicit-budget result without trusting a bare flag.
+
+    ``Judge`` marks several candidate-bound outcomes as retryable for its own
+    operational purposes.  An Agent total-budget retry is narrower: it may
+    repeat only a confirmed pre-admission overload or a terminal,
+    candidate-independent runtime/transport failure.  Deterministic
+    verification outcomes, resource limits, cancellation, unknown settlement,
+    and every execution timeout stop immediately.  A timeout is therefore
+    never used as a reason to spend another full-length attempt; the next
+    attempt, when any, is reserved for an independently evidenced failure.
+    """
+
+    minimum_attempt_seconds = min(AGENT_TIMEOUT_MIN_SECONDS, budget_seconds)
+    if (
+        remaining_budget_seconds
+        < minimum_attempt_seconds - _AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS
+    ):
+        return None
+    status = str(verdict.status or "").strip().upper()
+    if status in _CUSTOM_DETERMINISTIC_STATUSES:
+        return None
+    response = verdict.response if isinstance(verdict.response, Mapping) else {}
+
+    if status == "REJECTED_OVERLOADED":
+        # This status is safe only when the receipt proves that no job was
+        # admitted.  ``_evaluate_once`` already enforces the job-id/terminal
+        # binding; keep the explicit retryable marker as a second guard.
+        return "overload" if _retryable_admission_rejection(response) else None
+
+    error_kind = str(_nested_value(response, "error_kind") or "").strip().lower()
+    terminal_reason = str(
+        _nested_value(response, "terminal_reason") or ""
+    ).strip().lower()
+
+    if status in {"EVALUATOR_ERROR", "INFRASTRUCTURE_ERROR", "NETWORK_ERROR"}:
+        failure = response.get("evaluator_failure")
+        failure_category = ""
+        failure_http_status: int | None = None
+        if isinstance(failure, Mapping):
+            failure_category = str(failure.get("category") or "").strip().lower()
+            raw_http_status = failure.get("http_status")
+            if isinstance(raw_http_status, int) and not isinstance(raw_http_status, bool):
+                failure_http_status = raw_http_status
+        if error_kind in _CUSTOM_TRANSIENT_ERROR_KINDS:
+            return "execution"
+        if failure_category in _CUSTOM_TRANSIENT_ERROR_KINDS:
+            return "execution"
+        # ``_request`` raises this only after a confirmed pre-admission 429/
+        # 503 receipt (no bindable job id).  Keep it on the overload retry
+        # budget rather than flattening it into a generic execution failure.
+        if failure_category == "judge_overloaded":
+            return "overload"
+        # A coding/HTTP adapter exposes only a bounded HTTP status in its
+        # evaluator failure summary.  Retry server-side 5xx responses, but do
+        # not replay a client error or an ambiguous submission.
+        if failure_category == "http_error" and failure_http_status in {
+            500,
+            502,
+            503,
+            504,
+        }:
+            return "execution"
+        # A terminal receipt may expose only ``terminal_reason``.  Accept the
+        # bounded, candidate-independent labels but never a generic
+        # ``retryable=true`` without one of them.
+        if terminal_reason in {
+            "runtime_exception",
+            "workspace_not_ready",
+            "protocol_error",
+            "service_unavailable",
+            "connection_reset",
+            "connection_refused",
+            "network_error",
+        }:
+            return "execution"
+    return None
 
 
 def _terminal(payload: Mapping[str, Any]) -> bool:
@@ -3150,16 +4502,26 @@ def safe_worker_response(
     payload: Mapping[str, Any] | Any,
     *,
     _depth: int = 0,
+    timeout_max_seconds: int | float | None = None,
 ) -> dict[str, Any]:
     """Keep bounded verdict metadata while removing secrets and host details."""
 
     if not isinstance(payload, Mapping) or _depth > 2:
         return {}
+    try:
+        timeout_cap = agent_timeout_bounds(timeout_max_seconds).max_seconds
+    except ValueError:
+        timeout_cap = agent_timeout_bounds().max_seconds
     result: dict[str, Any] = {}
     for key in ("job_id", "id"):
         identifier = sanitize_worker_identifier(payload.get(key))
         if identifier is not None:
             result[key] = identifier
+    timeout_budget_number_fields = {
+        "timeout_budget_seconds",
+        "timeout_budget_elapsed_seconds",
+        "timeout_budget_remaining_seconds",
+    }
     for key in (
         "status",
         "formal_status",
@@ -3171,6 +4533,9 @@ def safe_worker_response(
         "lean_version",
         "judge_cache_backend",
         "judge_cache_status",
+        "timeout_budget_mode",
+        "timeout_budget_stop_reason",
+        "retry_blocked_reason",
     ):
         value = payload.get(key)
         if isinstance(value, str):
@@ -3196,6 +4561,8 @@ def safe_worker_response(
         "cancel_requested",
         "finalization_pending",
         "remote_settlement_unconfirmed",
+        "timeout_budget_exhausted",
+        "formal_backend_budget_exhausted",
     ):
         if isinstance(payload.get(key), bool):
             result[key] = payload[key]
@@ -3212,13 +4579,66 @@ def safe_worker_response(
         "admission_attempts",
         "evaluator_overload_resubmissions",
         "judge_cache_wait_ms",
+        "timeout_budget_seconds",
+        "timeout_budget_elapsed_seconds",
+        "timeout_budget_remaining_seconds",
+        "judge_attempt_count",
+        "judge_retry_count",
+        "backend_job_count",
     ):
         number = _safe_nonnegative_number(payload.get(key))
         if number is not None:
-            result[key] = number
+            result[key] = (
+                min(number, float(timeout_cap))
+                if key in timeout_budget_number_fields
+                else number
+            )
+    attempt_timeouts = payload.get("judge_attempt_timeouts_seconds")
+    if isinstance(attempt_timeouts, (list, tuple)):
+        result["judge_attempt_timeouts_seconds"] = [
+            max(0, min(int(item), timeout_cap))
+            for item in attempt_timeouts[:16]
+            if isinstance(item, int) and not isinstance(item, bool)
+        ]
+    attempt_elapsed = payload.get("judge_attempt_elapsed_seconds")
+    if isinstance(attempt_elapsed, (list, tuple)):
+        safe_elapsed: list[float] = []
+        for item in attempt_elapsed[:16]:
+            if isinstance(item, bool):
+                continue
+            try:
+                parsed = float(item)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(parsed) and parsed >= 0:
+                safe_elapsed.append(round(parsed, 6))
+        result["judge_attempt_elapsed_seconds"] = safe_elapsed
+    retry_reasons = payload.get("judge_retry_reasons")
+    if isinstance(retry_reasons, (list, tuple)):
+        result["judge_retry_reasons"] = [
+            sanitize_worker_text(item, 64)
+            for item in retry_reasons[:16]
+            if isinstance(item, str) and item.strip()
+        ]
+    attempt_ids = payload.get("judge_attempt_ids")
+    if isinstance(attempt_ids, (list, tuple)):
+        result["judge_attempt_ids"] = [
+            identifier
+            for item in attempt_ids[:16]
+            if (identifier := sanitize_worker_identifier(item)) is not None
+        ]
+    backend_job_numbers = payload.get("backend_job_numbers")
+    if isinstance(backend_job_numbers, (list, tuple)):
+        result["backend_job_numbers"] = [
+            max(0, min(int(item), 1_000_000))
+            for item in backend_job_numbers[:16]
+            if isinstance(item, int) and not isinstance(item, bool)
+        ]
     if isinstance(payload.get("response"), Mapping):
         result["response"] = safe_worker_response(
-            payload["response"], _depth=_depth + 1
+            payload["response"],
+            _depth=_depth + 1,
+            timeout_max_seconds=timeout_max_seconds,
         )
     if "probe_diagnostics" in payload:
         result["probe_diagnostics"] = _safe_probe_diagnostics(
@@ -3283,10 +4703,14 @@ def safe_worker_response(
     return result
 
 
-def _safe_response(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_response(
+    payload: Mapping[str, Any],
+    *,
+    timeout_max_seconds: int | float | None = None,
+) -> dict[str, Any]:
     """Backward-compatible internal alias for the response sanitizer."""
 
-    return safe_worker_response(payload)
+    return safe_worker_response(payload, timeout_max_seconds=timeout_max_seconds)
 
 
 def _safe_probe_diagnostics(value: Any) -> dict[str, Any]:
@@ -3375,10 +4799,14 @@ def _safe_nonnegative_number(value: Any) -> float | int | None:
     return value
 
 
-def _safe_nonterminal_response(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_nonterminal_response(
+    payload: Mapping[str, Any],
+    *,
+    timeout_max_seconds: int | float | None = None,
+) -> dict[str, Any]:
     """Retain diagnostics without serializing a pending state as a verdict."""
 
-    result = _safe_response(payload)
+    result = _safe_response(payload, timeout_max_seconds=timeout_max_seconds)
     observations: list[str] = []
 
     def scrub(node: dict[str, Any]) -> None:

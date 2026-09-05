@@ -16,6 +16,7 @@ import threading
 from typing import Any, Iterable, Mapping
 
 from .artifacts import atomic_write_json, atomic_write_text
+from .timeout_policy import agent_timeout_bounds
 
 
 TOOL_CAPABILITY_FILENAME = ".contextswarm_tool_capability.json"
@@ -469,6 +470,8 @@ def stage_worker_tools(
     *,
     capability: ToolCapability,
     baseline_names: Iterable[str],
+    agent_timeout_enabled: bool = False,
+    agent_timeout_cap_seconds: int | float | None = None,
 ) -> None:
     """Stage identical manifest-selected shims for Mono, Parallel, and CPS."""
 
@@ -489,6 +492,8 @@ def stage_worker_tools(
         destination / PUBLIC_FILES_FILENAME,
         public_files_manifest(
             baseline_names=baseline_names,
+            agent_timeout_enabled=agent_timeout_enabled,
+            agent_timeout_cap_seconds=agent_timeout_cap_seconds,
         ),
         mode=0o444,
     )
@@ -497,6 +502,8 @@ def stage_worker_tools(
 def public_files_manifest(
     *,
     baseline_names: Iterable[str],
+    agent_timeout_enabled: bool = False,
+    agent_timeout_cap_seconds: int | float | None = None,
 ) -> str:
     files = [
         "problem.md",
@@ -508,6 +515,19 @@ def public_files_manifest(
         EVALUATE_FILENAME,
         FORMAL_QUERY_FILENAME,
     ]
+    timeout_bounds = agent_timeout_bounds(agent_timeout_cap_seconds)
+    timeout_note = (
+        (
+            f"When enabled, add `--timeout N` with N in the configured "
+            f"{timeout_bounds.min_seconds}–{timeout_bounds.max_seconds} second "
+            "range; the value is the cumulative logical validation budget "
+            "across safe evaluator retries."
+        )
+        if agent_timeout_enabled
+        else "When the run advertises Agent timeout control, add `--timeout N`; "
+        "the value is the cumulative logical validation budget across safe "
+        "evaluator retries."
+    )
     lines = [
         "# Public Formal Worker Files",
         "",
@@ -519,7 +539,9 @@ def public_files_manifest(
         "",
         "## Formal capabilities",
         "",
-        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. Its result is agent-local feedback, never the official score.",
+        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. "
+        + timeout_note
+        + " It remains advisory, never the official score.",
         "- `./formal_query --help` describes bounded `search`, `decl`, `check`, `type`, `axioms`, and `deps` queries. `search` scans only `problem.md`, `result.lean`, `baseline/*.lean`, and the revision-bound declaration index.",
         "- `deps` returns index-related candidate premises, not a dependency graph. Verify names with `check`.",
         "- The final score comes only from the feedback-free outer evaluation of an immutable candidate snapshot.",
@@ -541,6 +563,9 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_DEFAULT_TRANSPORT_TIMEOUT_SECONDS = 480.0
+_TRANSPORT_TIMEOUT_GRACE_SECONDS = 120.0
+_MAX_TRANSPORT_TIMEOUT_SECONDS = 2_147_000_000.0
 
 def request(script_file: str, operation: str, payload: dict) -> dict:
     root = Path(script_file).resolve().parent
@@ -569,9 +594,29 @@ def request(script_file: str, operation: str, payload: dict) -> dict:
     if len(encoded) > 128 * 1024:
         raise RuntimeError("formal tool request is too large")
     raw_deadline = str(os.environ.get("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS") or "")
-    deadline_seconds = 480.0
+    # The helper's HTTP transport must outlive the configured Agent/Judge
+    # budget plus the bounded handoff grace.  The historical 480-second
+    # default remains for callers without the public cap environment, while a
+    # larger manifest cap (for example 600s) is not cut off by this client.
+    raw_cap = str(os.environ.get("CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS") or "")
+    transport_ceiling = _DEFAULT_TRANSPORT_TIMEOUT_SECONDS
+    if raw_cap.isascii() and raw_cap.isdigit() and int(raw_cap) > 0:
+        transport_ceiling = min(
+            _MAX_TRANSPORT_TIMEOUT_SECONDS,
+            max(
+                transport_ceiling,
+                float(int(raw_cap)) + _TRANSPORT_TIMEOUT_GRACE_SECONDS,
+            ),
+        )
+    deadline_seconds = transport_ceiling
     if raw_deadline.isascii() and raw_deadline.isdigit():
-        deadline_seconds = max(0.1, min(480.0, (int(raw_deadline) / 1000.0) - time.time() + 10.0))
+        deadline_seconds = max(
+            0.1,
+            min(
+                transport_ceiling,
+                (int(raw_deadline) / 1000.0) - time.time() + 10.0,
+            ),
+        )
     request = Request(
         f"{base_url}/{operation}",
         data=encoded,
@@ -591,18 +636,32 @@ def request(script_file: str, operation: str, payload: dict) -> dict:
 
 _EVALUATE_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
+import argparse
 import json
-import sys
 from _contextswarm_tool_client import request
 
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Bounded advisory Lean evaluation; never official proof evidence."
+    )
+    result.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="optional Agent-proposed cumulative validation budget in seconds (runner clamps it)",
+    )
+    return result
+
 def main() -> int:
+    args = parser().parse_args()
+    payload = {} if args.timeout is None else {"timeout_seconds": int(args.timeout)}
     try:
-        response = request(__file__, "evaluate_local", {})
+        response = request(__file__, "evaluate_local", payload)
     except Exception as error:
         print(json.dumps({"status": "EVALUATOR_ERROR", "message": type(error).__name__}, indent=2))
         return 2
     print(json.dumps(response, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if response.get("status") not in {"EVALUATOR_ERROR", "OUT_OF_HORIZON", "BUDGET_EXHAUSTED"} else 1
+    return 0 if response.get("status") not in {"EVALUATOR_ERROR", "EVALUATOR_TIMEOUT", "EXECUTION_TIMEOUT", "OUT_OF_HORIZON", "BUDGET_EXHAUSTED"} else 1
 
 if __name__ == "__main__":
     raise SystemExit(main())

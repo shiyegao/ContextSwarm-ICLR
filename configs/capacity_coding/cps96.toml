@@ -1,0 +1,40 @@
+extends = ["../paper_5min/_icpc_wf_2025.toml"]
+
+# Task-local capacity baseline; see cps24.toml.  This is the approximately
+# hundred active-solver-slot observation point.
+[experiment]
+name = "capacity-baseline-coding-cps96"
+output_root = "runs/capacity_baseline_coding/cps96"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 96
+initial_agents_per_task = 8
+max_attempts_per_task = 0
+episodes_per_task = 1
+max_tasks = 12
+time_limit_seconds = 180
+seed = 0
+cancel_on_proved = true
+
+[aisw]
+enabled = true
+max_in_flight = 96
+
+[allocation]
+agent_timeout_seconds = 180
+
+[judge]
+max_concurrent_evaluations = 96
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+
+[pi]
+thinking = "max"
+timeout_seconds = 180
+http_idle_timeout_ms = 600000
+
+[selection]
+enabled = false
+
+[docker]
+memory_mb = 32768

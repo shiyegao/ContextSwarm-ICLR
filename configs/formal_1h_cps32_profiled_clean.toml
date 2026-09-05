@@ -1,0 +1,9 @@
+extends = ["formal_1h_cps32_profiled.toml"]
+
+# Keep the one-hour experiment horizon, but leave enough client lifecycle
+# headroom for the Judge's final closeout evaluations.  The Judge publishes a
+# 20-second terminalization allowance beyond the 3600-second command budget;
+# the standard 3600-second client cap would reject those receipts as the run
+# drains, even when the backend is healthy.
+[lean]
+max_lifecycle_seconds = 4500

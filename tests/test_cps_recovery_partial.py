@@ -80,6 +80,41 @@ class _FailOnceThenSucceedPi(_FailTwiceThenSucceedPi):
         )
 
 
+class _StopThenSucceedPi:
+    """Return one terminal stop, then succeed on a fresh CPS assignment."""
+
+    def __init__(self, *, timed_out: bool = False, cancelled: bool = False) -> None:
+        if timed_out == cancelled:
+            raise ValueError("choose exactly one terminal stop kind")
+        self.timed_out = timed_out
+        self.cancelled = cancelled
+        self.calls: list[dict[str, object]] = []
+
+    def run(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        attempt = len(self.calls)
+        workdir = Path(kwargs["workdir"])
+        (workdir / "result.lean").write_text(
+            f"partial-{attempt}\n",
+            encoding="utf-8",
+        )
+        now = "2026-01-01T00:00:00+00:00"
+        first = attempt == 1
+        return AgentResult(
+            agent_id=str(kwargs["actor_id"]),
+            task_id=str(kwargs["task_id"]),
+            episode=int(kwargs["episode"]),
+            returncode=(124 if self.timed_out else 130) if first else 0,
+            started_at=now,
+            finished_at=now,
+            error_tail=("Pi RPC deadline elapsed" if self.timed_out else "Pi RPC was cancelled")
+            if first
+            else "",
+            timed_out=self.timed_out and first,
+            cancelled=self.cancelled and first,
+        )
+
+
 class _RecordingEvaluator:
     is_mock_evaluator = True
 
@@ -115,6 +150,139 @@ class _RecordingEvaluator:
 
 
 class CpsRecoveryPartialCandidateTests(unittest.TestCase):
+    def _run_terminal_stop_case(
+        self,
+        pi: _StopThenSucceedPi,
+    ) -> tuple[list[tuple[AgentResult, Verdict]], list[dict[str, object]], _RecordingEvaluator, _Broker]:
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            max_attempts_per_task=2,
+            time_limit_seconds=2,
+            pi_recovery_enabled=True,
+            pi_recovery_max_restarts=1,
+            pi_recovery_base_delay_ms=0,
+        )
+        task = load_tasks(config)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            evaluator = _RecordingEvaluator()
+            broker = _Broker()
+            scheduler_results: list[AgentResult] = []
+            results = _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                evaluator,
+                pi,
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 2.0,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=broker,
+                scheduler_result_sink=scheduler_results,
+            )
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text().splitlines()
+            ]
+            # Copy only bounded, in-memory evidence before the temporary run
+            # directory is removed.  No prompt/provider payload is retained.
+            return results, events, evaluator, broker
+
+    def test_timeout_does_not_recover_same_actor_but_cps_admits_fresh_assignment(self):
+        pi = _StopThenSucceedPi(timed_out=True)
+        results, events, evaluator, broker = self._run_terminal_stop_case(pi)
+
+        self.assertEqual(len(pi.calls), 2)
+        self.assertNotEqual(pi.calls[0]["actor_id"], pi.calls[1]["actor_id"])
+        self.assertEqual([call["episode"] for call in pi.calls], [1, 2])
+        self.assertEqual(evaluator.candidates, ["partial-2\n"])
+        self.assertEqual(broker.calls, 2)
+        self.assertFalse(
+            any(
+                row.get("event")
+                in {
+                    "agent_recovery_scheduled",
+                    "agent_recovery_started",
+                    "agent_refill_scheduled",
+                    "agent_refill_started",
+                }
+                for row in events
+            )
+        )
+        observed = next(
+            row
+            for row in events
+            if row.get("event") == "agent_recovery_failure_observed"
+        )
+        self.assertTrue(observed["timed_out"])
+        self.assertFalse(observed["recoverable"])
+        exhausted = next(
+            row for row in events if row.get("event") == "agent_recovery_exhausted"
+        )
+        self.assertEqual(exhausted["reason"], "task_timeout")
+        assigned = [row for row in events if row.get("event") == "agent_assigned"]
+        self.assertEqual(len(assigned), 2)
+        self.assertEqual(
+            [row.get("allocation_phase") for row in assigned],
+            ["initial", "adaptive"],
+        )
+        self.assertEqual(
+            sorted(verdict.status for _result, verdict in results),
+            ["AGENT_FAILURE", "MOCK_SKIPPED"],
+        )
+
+    def test_intentional_cancel_does_not_recover_same_actor_but_cps_admits_fresh_assignment(self):
+        pi = _StopThenSucceedPi(cancelled=True)
+        results, events, evaluator, broker = self._run_terminal_stop_case(pi)
+
+        self.assertEqual(len(pi.calls), 2)
+        self.assertNotEqual(pi.calls[0]["actor_id"], pi.calls[1]["actor_id"])
+        self.assertEqual([call["episode"] for call in pi.calls], [1, 2])
+        self.assertEqual(evaluator.candidates, ["partial-2\n"])
+        self.assertEqual(broker.calls, 2)
+        self.assertFalse(
+            any(
+                row.get("event")
+                in {
+                    "agent_recovery_scheduled",
+                    "agent_recovery_started",
+                    "agent_refill_scheduled",
+                    "agent_refill_started",
+                }
+                for row in events
+            )
+        )
+        observed = next(
+            row
+            for row in events
+            if row.get("event") == "agent_recovery_failure_observed"
+        )
+        self.assertTrue(observed["cancelled"])
+        self.assertFalse(observed["recoverable"])
+        exhausted = next(
+            row for row in events if row.get("event") == "agent_recovery_exhausted"
+        )
+        self.assertEqual(exhausted["reason"], "intentional_cancel")
+        assigned = [row for row in events if row.get("event") == "agent_assigned"]
+        self.assertEqual(len(assigned), 2)
+        self.assertEqual(
+            [row.get("allocation_phase") for row in assigned],
+            ["initial", "adaptive"],
+        )
+        self.assertEqual(
+            sorted(verdict.status for _result, verdict in results),
+            ["CANCELLED", "MOCK_SKIPPED"],
+        )
+
     def test_exhausted_solver_recovery_skips_partial_candidate_and_refills_slot(self):
         base = load_config("configs/smoke.toml", ROOT)
         config = replace(

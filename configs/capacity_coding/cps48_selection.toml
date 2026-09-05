@@ -1,0 +1,22 @@
+extends = ["cps48.toml"]
+
+# Selection-enabled capacity observation.  Random is deliberately used as a
+# policy-neutral registered selector so this run measures the selection/CPS
+# persistence path rather than making an algorithm-quality claim.
+[experiment]
+name = "capacity-selection-coding-cps48"
+output_root = "runs/selection_coding/cps48"
+
+[selection]
+enabled = true
+selector_name = "random"
+selector_version = "capacity_profile_v1"
+visibility = "project_shared"
+trace_slot_limit = 8
+context_token_budget = 4096
+tokenizer = "utf8_bytes_ceil_div4_v1"
+seed = 0
+tie_break = "trace_id_asc"
+policy_params = { sample_without_replacement = true }
+direct_messages = false
+candidate_transfer = false
