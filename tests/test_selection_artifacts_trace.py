@@ -289,6 +289,68 @@ class TraceSelectionArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactValidationError, "canonical JSON"):
             validate_selection_store_export(rows)
 
+    def test_validator_accepts_legacy_candidate_watermark_and_rejects_mismatch(self) -> None:
+        """New exports omit child watermarks; old exports remain auditable."""
+
+        search = self.store.record_search(
+            request_key="pool-legacy-export",
+            task_id="task-1",
+            actor_id="worker-1",
+            selector_config_id=self.config["selector_config_id"],
+            query={"text": "lemma"},
+            comparison_identity="comparison",
+            snapshot_identity={"watermark": 4},
+            pool_identity={"traces": ["pool-a", "pool-b"]},
+            eligible_candidates=[
+                {"trace_id": "pool-a", "title": "a", "body": "proof a"},
+                {"trace_id": "pool-b", "title": "b", "body": "proof b"},
+            ],
+            snapshot_watermarks={"commit_seq": 4},
+            rankings=[
+                {"trace_id": "pool-a", "rank": 1, "selected": True},
+                {"trace_id": "pool-b", "rank": 2, "selected": False},
+            ],
+        )
+        path = self.root / "pool-export.jsonl"
+        self.store.export_jsonl(path)
+        rows = self._rows(path)
+        candidates = [row for row in rows if row["record_type"] == "search_candidate"]
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(all("snapshot_watermarks" not in row["record"] for row in candidates))
+        validate_selection_store_export(rows)
+
+        parent = next(row for row in rows if row["record_type"] == "search_event")["record"]
+        watermark = parent["snapshot_watermarks"]
+        for row in candidates:
+            row["record"]["snapshot_watermarks"] = dict(watermark)
+        validate_selection_store_export(rows)
+
+        partial_parent = json.loads(json.dumps(rows))
+        partial_search = next(
+            row for row in partial_parent if row["record_type"] == "search_event"
+        )
+        del partial_search["record"]["snapshot_watermarks_sha256"]
+        with self.assertRaisesRegex(ArtifactValidationError, "pool snapshot fields must be complete"):
+            validate_selection_store_export(partial_parent)
+
+        partial_empty_parent = json.loads(json.dumps(rows))
+        partial_empty_search = next(
+            row for row in partial_empty_parent if row["record_type"] == "search_event"
+        )
+        partial_empty_search["record"]["snapshot_watermarks"] = {}
+        del partial_empty_search["record"]["snapshot_watermarks_sha256"]
+        del partial_empty_search["record"]["eligible_candidates_sha256"]
+        with self.assertRaisesRegex(ArtifactValidationError, "pool snapshot fields must be complete"):
+            validate_selection_store_export(partial_empty_parent)
+
+        del candidates[0]["record"]["snapshot_watermarks"]
+        with self.assertRaisesRegex(ArtifactValidationError, "all present or all absent"):
+            validate_selection_store_export(rows)
+        candidates[0]["record"]["snapshot_watermarks"] = dict(watermark)
+        candidates[0]["record"]["snapshot_watermarks"] = {"commit_seq": 999}
+        with self.assertRaisesRegex(ArtifactValidationError, "watermark mismatch"):
+            validate_selection_store_export(rows)
+
 
 if __name__ == "__main__":
     unittest.main()

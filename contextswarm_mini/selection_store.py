@@ -12,6 +12,7 @@ worker interaction's single effective terminal-feedback slot.
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -28,6 +29,12 @@ from typing import Any, Iterable, Mapping, Sequence
 SCHEMA_VERSION = "contextswarm_selection_store_v1"
 EXPORT_SCHEMA_VERSION = "contextswarm_selection_store_export_v1"
 REQUEST_KEY_CONFLICT = "REQUEST_KEY_CONFLICT"
+
+# ``SCHEMA_VERSION`` is intentionally kept at v1: the public JSONL contract
+# and the logical selection-store schema did not change.  The candidate pool
+# table did, however, gain a storage-only migration which moves the immutable
+# watermark to its parent ``search_events`` row.  The physical column itself
+# is the restart marker, so no new public schema/version field is needed.
 
 CANONICAL_FEEDBACK_KINDS = frozenset(
     {
@@ -270,7 +277,6 @@ class SelectionStore:
                     candidate_sha256 TEXT NOT NULL,
                     candidate_payload_json TEXT NOT NULL,
                     feedback_snapshot_json TEXT NOT NULL,
-                    snapshot_watermarks_json TEXT NOT NULL,
                     UNIQUE(search_event_id, trace_id),
                     UNIQUE(search_event_id, pool_order)
                 );
@@ -431,20 +437,360 @@ class SelectionStore:
             # request-identity columns lazily instead of requiring a destructive
             # migration.  SQLite's ALTER TABLE is atomic under the connection
             # and the defaults make old rows semantically "no pool artifact".
-            existing_columns = {
-                str(row[1]) for row in db.execute("PRAGMA table_info(search_events)")
-            }
-            for column, definition in (
+            parent_definitions = (
                 ("eligible_candidates_sha256", "TEXT NOT NULL DEFAULT ''"),
                 ("snapshot_watermarks_sha256", "TEXT NOT NULL DEFAULT ''"),
                 ("snapshot_watermarks_json", "TEXT NOT NULL DEFAULT '{}'"),
-            ):
-                if column not in existing_columns:
-                    db.execute(f"ALTER TABLE search_events ADD COLUMN {column} {definition}")
+            )
+            existing_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(search_events)")
+            }
+            candidate_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(search_candidates)")
+            }
+            needs_schema_lock = (
+                any(column not in existing_columns for column, _definition in parent_definitions)
+                or "snapshot_watermarks_json" in candidate_columns
+            )
+            if needs_schema_lock:
+                # Parent-column additions and candidate-column removal share
+                # one transaction.  This prevents concurrent openers from
+                # racing into duplicate-column errors and rolls back all
+                # schema changes if watermark validation fails.
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    existing_columns = {
+                        str(row[1]) for row in db.execute("PRAGMA table_info(search_events)")
+                    }
+                    for column, definition in parent_definitions:
+                        if column not in existing_columns:
+                            db.execute(
+                                f"ALTER TABLE search_events ADD COLUMN {column} {definition}"
+                            )
+                            existing_columns.add(column)
+                    self._migrate_candidate_watermark_column(
+                        db, manage_transaction=False
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
             db.execute(
                 "INSERT OR IGNORE INTO selection_store_metadata(schema_version, created_at) VALUES(?, ?)",
                 (SCHEMA_VERSION, _now()),
             )
+
+    @staticmethod
+    def _watermark_from_json(raw: Any, *, context: str) -> tuple[dict[str, Any], str]:
+        """Decode and canonicalize one persisted watermark object."""
+
+        try:
+            value = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{context} contains invalid snapshot watermarks JSON") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{context} snapshot watermarks must be an object")
+        prepared = dict(value)
+        try:
+            canonical = _json(prepared)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{context} snapshot watermarks are not canonical JSON") from exc
+        return prepared, canonical
+
+    def _migrate_candidate_watermark_column(
+        self, db: sqlite3.Connection, *, manage_transaction: bool = True
+    ) -> None:
+        """Drop the legacy per-candidate watermark column without data loss.
+
+        The migration is deliberately data-aware.  A candidate watermark is
+        immutable selection-level evidence, so every non-empty legacy value
+        for one ``search_event`` must agree with the parent.  If an old parent
+        was created with the migration defaults (``{}``/empty digest), the
+        common candidate value is promoted first.  Contradictory or malformed
+        rows fail closed and leave the old table untouched for operator
+        inspection/retry.
+        """
+
+        owns_transaction = manage_transaction
+        if owns_transaction:
+            # Avoid taking a writer lock for the overwhelmingly common
+            # fresh/newly migrated path.  This is only a fast-path hint: it
+            # must be rechecked after locking below because another opener may
+            # drop the column between this read and BEGIN IMMEDIATE.
+            columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(search_candidates)")
+            }
+            if "snapshot_watermarks_json" not in columns:
+                return
+            if sqlite3.sqlite_version_info < (3, 35, 0):
+                raise RuntimeError(
+                    "selection store snapshot deduplication requires SQLite >= 3.35"
+                )
+            # Holding the schema rewrite and parent normalization under
+            # BEGIN IMMEDIATE keeps concurrent store openers from observing a
+            # half-migrated table.
+            db.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-check after acquiring the writer lock.  Another opener may
+            # have completed the DROP COLUMN while this connection waited;
+            # querying the legacy column before this point would race with
+            # that schema rewrite.
+            columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(search_candidates)")
+            }
+            if "snapshot_watermarks_json" not in columns:
+                if owns_transaction:
+                    db.execute("COMMIT")
+                return
+            if sqlite3.sqlite_version_info < (3, 35, 0):
+                raise RuntimeError(
+                    "selection store snapshot deduplication requires SQLite >= 3.35"
+                )
+            # A non-empty parent pool digest with no child rows cannot be
+            # replayed after the legacy column is removed.  Treat that state
+            # as corruption and fail closed instead of preserving an
+            # apparently valid-but-unjoinable parent record.
+            dangling_pool = db.execute(
+                """SELECT search_event_id
+                     FROM search_events AS e
+                    WHERE COALESCE(e.eligible_candidates_sha256, '') <> ''
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM search_candidates AS c
+                           WHERE c.search_event_id = e.search_event_id
+                      )
+                    ORDER BY search_event_id
+                    LIMIT 1"""
+            ).fetchone()
+            if dangling_pool is not None:
+                raise ValueError(
+                    "cannot deduplicate search event with pool digest but no "
+                    f"candidate rows {dangling_pool['search_event_id']!r}"
+                )
+            # Stream candidates in selection order.  A historical run can
+            # contain millions of rows and hundreds of megabytes of repeated
+            # JSON; retaining a list/dict for the whole table would recreate
+            # the very memory pressure this migration is meant to remove.
+            candidate_rows = db.execute(
+                """SELECT c.search_candidate_id, c.search_event_id,
+                          c.snapshot_watermarks_json,
+                          c.candidate_payload_json,
+                          c.trace_id,
+                          c.pool_order,
+                          c.candidate_sha256,
+                          c.feedback_snapshot_json,
+                          e.snapshot_watermarks_json AS parent_watermarks_json,
+                          e.snapshot_watermarks_sha256 AS parent_watermarks_sha256,
+                          e.eligible_candidates_sha256 AS parent_candidates_sha256
+                    FROM search_candidates AS c
+                LEFT JOIN search_events AS e
+                       ON e.search_event_id = c.search_event_id
+                    ORDER BY c.search_event_id, c.pool_order"""
+            )
+            current_search_id: str | None = None
+            current_candidate_value: dict[str, Any] | None = None
+            current_candidate_canonical: str | None = None
+            current_parent_value: dict[str, Any] | None = None
+            current_parent_canonical: str | None = None
+            current_parent_raw: str | None = None
+            current_parent_hash = ""
+            current_parent_candidates_hash = ""
+            current_candidates_hash = hashlib.sha256()
+            current_candidate_count = 0
+
+            def flush_current() -> None:
+                nonlocal current_search_id, current_candidate_value
+                nonlocal current_candidate_canonical, current_parent_value
+                nonlocal current_parent_canonical, current_parent_raw, current_parent_hash
+                nonlocal current_parent_candidates_hash, current_candidates_hash
+                nonlocal current_candidate_count
+                if current_search_id is None:
+                    return
+                assert current_candidate_canonical is not None
+                assert current_parent_canonical is not None
+                assert current_parent_value is not None
+                # ``_identity_sha256(list)`` is the SHA of a canonical JSON
+                # array.  Stream its delimiters/elements so reconstruction of
+                # a missing parent pool hash remains bounded by one payload.
+                current_candidates_hash.update(b"]")
+                computed_candidates_hash = current_candidates_hash.hexdigest()
+                if current_parent_candidates_hash:
+                    if current_parent_candidates_hash != computed_candidates_hash:
+                        raise ValueError(
+                            "cannot deduplicate candidate pool: parent digest "
+                            f"is invalid for search event {current_search_id!r}"
+                        )
+                else:
+                    db.execute(
+                        """UPDATE search_events
+                              SET eligible_candidates_sha256 = ?
+                            WHERE search_event_id = ?""",
+                        (computed_candidates_hash, current_search_id),
+                    )
+                parent_hash = _identity_sha256(current_parent_value)
+                if current_parent_hash and current_parent_hash != parent_hash:
+                    raise ValueError(
+                        "cannot deduplicate snapshot watermarks: parent digest "
+                        f"is invalid for search event {current_search_id!r}"
+                    )
+                if current_parent_canonical != current_candidate_canonical:
+                    # A default/empty parent is the only legacy state that can
+                    # be repaired without choosing between two immutable
+                    # records.  Otherwise fail closed rather than discarding a
+                    # candidate-specific value during DROP COLUMN.  An
+                    # explicitly hashed empty object is immutable too, so only
+                    # an empty digest permits promotion.
+                    if current_parent_canonical != "{}" or current_parent_hash:
+                        raise ValueError(
+                            "cannot deduplicate snapshot watermarks: parent and "
+                            f"candidate values differ for search event {current_search_id!r}"
+                        )
+                    assert current_candidate_value is not None
+                    db.execute(
+                        """UPDATE search_events
+                              SET snapshot_watermarks_json = ?,
+                                  snapshot_watermarks_sha256 = ?
+                            WHERE search_event_id = ?""",
+                        (
+                            current_candidate_canonical,
+                            _identity_sha256(current_candidate_value),
+                            current_search_id,
+                        ),
+                    )
+                elif (
+                    not current_parent_hash
+                    or current_parent_hash != parent_hash
+                    or current_parent_raw != current_parent_canonical
+                ):
+                    # Normalize legacy whitespace/key ordering and repair a
+                    # missing digest while we still hold the migration lock.
+                    # Even an empty/default watermark gets a digest when a
+                    # candidate pool proves that the parent participates in
+                    # the pool identity contract.
+                    db.execute(
+                        """UPDATE search_events
+                              SET snapshot_watermarks_json = ?,
+                                  snapshot_watermarks_sha256 = ?
+                            WHERE search_event_id = ?""",
+                        (current_parent_canonical, parent_hash, current_search_id),
+                    )
+
+            for row in candidate_rows:
+                search_event_id = str(row["search_event_id"])
+                if search_event_id != current_search_id:
+                    flush_current()
+                    current_search_id = search_event_id
+                    if row["parent_watermarks_json"] is None:
+                        raise ValueError(
+                            "cannot migrate search candidate with unknown search event "
+                            f"{search_event_id!r}"
+                        )
+                    current_parent_value, current_parent_canonical = self._watermark_from_json(
+                        row["parent_watermarks_json"],
+                        context=f"search event {search_event_id}",
+                    )
+                    current_parent_raw = str(row["parent_watermarks_json"])
+                    current_parent_hash = str(row["parent_watermarks_sha256"] or "")
+                    current_parent_candidates_hash = str(
+                        row["parent_candidates_sha256"] or ""
+                    )
+                    current_candidate_value = None
+                    current_candidate_canonical = None
+                    current_candidates_hash = hashlib.sha256(b"[")
+                    current_candidate_count = 0
+                expected_pool_order = current_candidate_count + 1
+                try:
+                    actual_pool_order = int(row["pool_order"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "cannot migrate candidate with invalid pool order "
+                        f"{row['search_candidate_id']!r}"
+                    ) from exc
+                if actual_pool_order != expected_pool_order:
+                    raise ValueError(
+                        "cannot deduplicate candidate pool with non-contiguous "
+                        f"pool order for search event {search_event_id!r}"
+                    )
+                candidate_value, candidate_canonical = self._watermark_from_json(
+                    row["snapshot_watermarks_json"],
+                    context=f"search candidate {row['search_candidate_id']}",
+                )
+                if current_candidate_canonical is None:
+                    current_candidate_value = candidate_value
+                    current_candidate_canonical = candidate_canonical
+                elif current_candidate_canonical != candidate_canonical:
+                    raise ValueError(
+                        "cannot deduplicate conflicting snapshot watermarks for "
+                        f"search event {search_event_id!r}"
+                    )
+                try:
+                    payload = json.loads(str(row["candidate_payload_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "cannot migrate candidate with invalid payload JSON "
+                        f"{row['search_candidate_id']!r}"
+                    ) from exc
+                if not isinstance(payload, Mapping):
+                    raise ValueError(
+                        "cannot migrate candidate payload that is not an object "
+                        f"{row['search_candidate_id']!r}"
+                    )
+                if payload.get("trace_id") != str(row["trace_id"]):
+                    raise ValueError(
+                        "cannot migrate candidate payload trace_id mismatch "
+                        f"{row['search_candidate_id']!r}"
+                    )
+                candidate_hash = _identity_sha256(dict(payload))
+                if str(row["candidate_sha256"]) != candidate_hash:
+                    raise ValueError(
+                        "cannot migrate candidate payload hash mismatch "
+                        f"{row['search_candidate_id']!r}"
+                    )
+                try:
+                    feedback_snapshot = json.loads(str(row["feedback_snapshot_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "cannot migrate candidate with invalid feedback snapshot JSON "
+                        f"{row['search_candidate_id']!r}"
+                    ) from exc
+                if not isinstance(feedback_snapshot, Mapping):
+                    raise ValueError(
+                        "cannot migrate candidate feedback snapshot that is not an object "
+                        f"{row['search_candidate_id']!r}"
+                    )
+                payload_feedback = payload.get("feedback", {})
+                if not isinstance(payload_feedback, Mapping) or dict(payload_feedback) != dict(
+                    feedback_snapshot
+                ):
+                    raise ValueError(
+                        "cannot migrate candidate feedback snapshot mismatch "
+                        f"{row['search_candidate_id']!r}"
+                    )
+                if current_candidate_count:
+                    current_candidates_hash.update(b",")
+                current_candidates_hash.update(_json(dict(payload)).encode("utf-8"))
+                current_candidate_count += 1
+            flush_current()
+
+            # SQLite 3.35+ supports an atomic DROP COLUMN and is part of the
+            # project runtime baseline.  Keep a clear error for an older
+            # embedded SQLite instead of silently retaining the duplication.
+            try:
+                db.execute(
+                    "ALTER TABLE search_candidates DROP COLUMN snapshot_watermarks_json"
+                )
+            except sqlite3.OperationalError as exc:
+                raise RuntimeError(
+                    "selection store requires SQLite DROP COLUMN support to "
+                    "deduplicate candidate snapshot watermarks"
+                ) from exc
+            if owns_transaction:
+                db.execute("COMMIT")
+        except BaseException:
+            if owns_transaction and db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
 
     def register_selector_config(
         self, *, selector_name: str, config: Mapping[str, Any]
@@ -613,8 +959,8 @@ class SelectionStore:
                     """INSERT INTO search_candidates(
                            search_candidate_id, search_event_id, trace_id, pool_order,
                            candidate_sha256, candidate_payload_json,
-                           feedback_snapshot_json, snapshot_watermarks_json
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                           feedback_snapshot_json
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
                     (
                         candidate_id,
                         search_event_id,
@@ -623,7 +969,6 @@ class SelectionStore:
                         candidate["candidate_sha256"],
                         _json(candidate["payload"]),
                         _json(candidate["feedback_snapshot"]),
-                        watermarks_json,
                     ),
                 )
             db.execute(
@@ -1175,14 +1520,22 @@ class SelectionStore:
                 (search_event_id,),
             )
         ]
-        candidates = [
-            _decode_row(row) or {}
-            for row in db.execute(
-                """SELECT * FROM search_candidates
-                   WHERE search_event_id = ? ORDER BY pool_order, trace_id""",
-                (search_event_id,),
+        candidates = []
+        for row in db.execute(
+            """SELECT * FROM search_candidates
+               WHERE search_event_id = ? ORDER BY pool_order, trace_id""",
+            (search_event_id,),
+        ):
+            candidate = _decode_row(row) or {}
+            # Keep the historical in-memory/API shape for callers that use a
+            # candidate as a self-contained replay object.  This is a derived
+            # projection; the immutable value is physically stored once on
+            # ``search_events``.
+            candidate.setdefault(
+                "snapshot_watermarks",
+                copy.deepcopy(search.get("snapshot_watermarks", {})),
             )
-        ]
+            candidates.append(candidate)
         items: list[dict[str, Any]] = []
         if exposure is not None:
             items = [
@@ -1419,10 +1772,16 @@ class SelectionStore:
                             f"SELECT * FROM {table} ORDER BY {id_column}"
                         )
                         for row in rows:
+                            decoded = _decode_row(row) or {}
+                            # The immutable snapshot watermark is exported
+                            # once on the parent search_event.  Legacy exports
+                            # may still contain a candidate-level copy and are
+                            # accepted by the artifact validator, but new
+                            # exports deliberately omit that redundant field.
                             envelope = {
                                 "schema": EXPORT_SCHEMA_VERSION,
                                 "record_type": record_type,
-                                "record": _decode_row(row) or {},
+                                "record": decoded,
                             }
                             encoded = (_json(envelope) + "\n").encode("utf-8")
                             handle.write(encoded)
